@@ -1,0 +1,6 @@
+source;share/tb4_sensor_reader/hook/pythonpath.ps1
+source;share/tb4_sensor_reader/hook/pythonpath.dsv
+source;share/tb4_sensor_reader/hook/pythonpath.sh
+source;share/tb4_sensor_reader/hook/ament_prefix_path.ps1
+source;share/tb4_sensor_reader/hook/ament_prefix_path.dsv
+source;share/tb4_sensor_reader/hook/ament_prefix_path.sh

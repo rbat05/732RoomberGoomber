@@ -1,0 +1,95 @@
+alias cw='cd ~/ros2_ws'
+alias cws='cd ~/ros2_ws/src'
+
+alias cb='cd ~/ros2_ws && colcon build && source ~/ros2_ws/install/setup.bash && cd -'
+alias cb-delete='cd ~/ros2_ws && rm -r install/ build/ log/ && colcon build && source ~/ros2_ws/install/setup.bash && cd -'
+
+# Declare an associative array
+declare -A ip_addresses
+
+# Populate the array for keys 1 to 30.
+# The last octet of the IP address is 9 + key (1 becomes 10, 30 becomes 39)
+for i in {1..30}; do
+  ip_addresses[$i]="172.24.192.$((9 + i))"
+done
+
+get_ip() {
+  local key=$1
+  if [[ -z "${ip_addresses[$key]}" ]]; then
+    echo "Error: No IP defined for key '$key'" >&2
+    return 1
+  fi
+  echo "${ip_addresses[$key]}"
+}
+
+set_turtlebot_params() {
+    echo "Setting parameters: $@"
+    for param in "$@"; do
+        key="${param%%=*}"        # Extract key (before =)
+        value="${param#*=}"       # Extract value (after =)
+        echo "$key=$value"        # Display what's being set
+        sed -i "/^$key=/d" ~/.turtlebot_parms 2>/dev/null  # Remove existing key
+        echo "$key=$value" >> ~/.turtlebot_parms           # Append new key-value pair
+        export "$key=$value"                         # Set environment variable
+    done
+}
+
+unset_turtlebot_param() {
+    key="$1"
+    echo "Unsetting parameter: $key"
+    sed -i "/^$key=/d" ~/.turtlebot_parms 2>/dev/null  # Remove from file
+    unset "$key"                                # Unset from environment
+}
+
+update_turtlebot_params() {
+    echo "Updating parameters: $@"
+    set_turtlebot_params "$@"  # Reuse set_turtlebot_parms function to overwrite
+}
+
+
+sanity(){
+echo "DOMAIN ID: $ROS_DOMAIN_ID" 
+echo "SERVER: $ROS_DISCOVERY_SERVER"
+echo "Profile: $FASTRTPS_DEFAULT_PROFILES_FILE"
+echo "Local: $ROS_LOCALHOST_ONLY"
+}
+
+set-simulation(){
+set_turtlebot_params ROS_LOCALHOST_ONLY=1
+unset_turtlebot_param FASTRTPS_DEFAULT_PROFILES_FILE
+unset_turtlebot_param ROS_DISCOVERY_SERVER
+set_turtlebot_params ROS_DOMAIN_ID=42
+ros2 daemon stop && ros2 daemon start
+}
+
+set-turtlebot(){
+local ip=$(get_ip "$1")
+set_turtlebot_params ROS_LOCALHOST_ONLY=0
+
+local xml_file="$HOME/super_client_configuration_file.xml"
+sed -i 's|\(<address>\)[^<]*\(</address>\)|\1'"${ip}"'\2|' "$xml_file"
+set_turtlebot_params FASTRTPS_DEFAULT_PROFILES_FILE="$HOME/super_client_configuration_file.xml"
+
+set_turtlebot_params ROS_DISCOVERY_SERVER="${ip}:11811"
+set_turtlebot_params ROS_DOMAIN_ID=$1
+
+ros2 daemon stop && ros2 daemon start
+}
+
+unset-turtlebot(){
+set_turtlebot_params ROS_LOCALHOST_ONLY=0
+unset_turtlebot_param FASTRTPS_DEFAULT_PROFILES_FILE
+unset_turtlebot_param ROS_DISCOVERY_SERVER
+unset_turtlebot_param ROS_DOMAIN_ID
+ros2 daemon stop && ros2 daemon start
+}
+
+# Function to load stored parameters on terminal startup
+if [ -f ~/.turtlebot_parms ]; then
+    while IFS='=' read -r key value; do
+        [[ -z "$key" || "$key" == \#* ]] && continue  # Ignore empty lines and comments
+        export "$key=$value"
+    done < ~/.turtlebot_parms
+    echo "Loaded stored parameters:"
+    cat ~/.turtlebot_parms
+fi
