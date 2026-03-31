@@ -21,6 +21,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
+from irobot_create_msgs.msg import InterfaceButtons
 
 # ── TODO: Set your robot namespace ─────────────────────────────────────────────
 NAMESPACE = '/T11'           # Change to your robot e.g. /T10
@@ -29,7 +30,7 @@ NAMESPACE = '/T11'           # Change to your robot e.g. /T10
 FORWARD_SPEED = 0.1          # m/s  — linear velocity when driving forward
 TURN_SPEED    = 0.5          # rad/s — angular velocity when turning
 FORWARD_DURATION = 5.0       # seconds to drive for each straight-line test
-NUM_RUNS = 5                 # each run performs 2 straight-line tests
+NUM_RUNS = 5                 # number of straight-line runs to perform
 # Example durations for known distances/angles:
 #   Drive 1.0 m at 0.2 m/s  → duration = 1.0 / 0.2 = 5.0 seconds
 #   Turn 90°  at 0.5 rad/s  → duration = (pi/2) / 0.5 = 3.14 seconds
@@ -59,6 +60,11 @@ class TestNode(Node):
             f'{NAMESPACE}/scan',
             self.scan_callback,
             10)
+        self.button_sub = self.create_subscription(
+            InterfaceButtons,
+            '/hmi/buttons',
+            self.buttons_callback,
+            10)
 
         # ── State variables ──────────────────────────────────────────────────
         # These store the latest sensor readings so any callback can use them
@@ -73,6 +79,9 @@ class TestNode(Node):
         self.phase_start_time = None
         self.test_done = False
         self.current_run = 1
+        self.last_button2_pressed = False
+        self.pending_next_run = False
+        self.waiting_for_button_logged = False
         self.log_counter = 0
         self.leg_start_x = 0.0
         self.leg_start_y = 0.0
@@ -136,79 +145,89 @@ class TestNode(Node):
 
         now = self.get_clock().now().nanoseconds / 1e9   # current time in seconds
 
-        # ── Straight-line distance sequence (5 runs, 2 legs per run) ─────────
+        # ── Straight-line run sequence (trigger next run from HMI button) ────
 
-        # Phase 0 — Drive forward (leg 1)
+        # Phase 0 — Drive forward (single run)
         if self.phase == 0:
             if self.phase_start_time is None:
                 self.phase_start_time = now
                 self.leg_start_x = self.current_x
                 self.leg_start_y = self.current_y
                 self.get_logger().info(
-                    f'Run {self.current_run}/{NUM_RUNS} | Leg 1: Driving forward')
+                    f'Run {self.current_run}/{NUM_RUNS} | Driving forward')
             elapsed = now - self.phase_start_time
             if elapsed < FORWARD_DURATION:
                 self.drive(FORWARD_SPEED, 0.0)
             else:
                 self.stop()
-                self.log_leg_result(1, elapsed)
+                self.log_leg_result(elapsed)
                 self.phase += 1
                 self.phase_start_time = None
 
-        # Phase 1 — Turn around 180 degrees
+        # Phase 1 — Wait for HMI button 2 to trigger next run
         elif self.phase == 1:
+            self.stop()
+            if self.current_run >= NUM_RUNS:
+                self.get_logger().info('Test sequence complete — stopping')
+                self.test_done = True
+            elif self.pending_next_run:
+                self.pending_next_run = False
+                self.waiting_for_button_logged = False
+                self.phase = 2
+                self.phase_start_time = None
+            elif not self.waiting_for_button_logged:
+                self.get_logger().info(
+                    'Waiting for HMI button create3_2 on /hmi/buttons')
+                self.waiting_for_button_logged = True
+
+        # Phase 2 — Turn around 180 degrees
+        elif self.phase == 2:
             if self.phase_start_time is None:
                 self.phase_start_time = now
                 self.get_logger().info(
-                    f'Run {self.current_run}/{NUM_RUNS} | Turning 180 degrees')
+                    f'Run {self.current_run + 1}/{NUM_RUNS} | Turning 180 degrees')
             elapsed = now - self.phase_start_time
             if elapsed < self.turn_duration:
                 self.drive(0.0, TURN_SPEED)
             else:
                 self.stop()
-                self.phase += 1
-                self.phase_start_time = None
-
-        # Phase 2 — Drive forward (leg 2)
-        elif self.phase == 2:
-            if self.phase_start_time is None:
-                self.phase_start_time = now
-                self.leg_start_x = self.current_x
-                self.leg_start_y = self.current_y
-                self.get_logger().info(
-                    f'Run {self.current_run}/{NUM_RUNS} | Leg 2: Driving forward')
-            elapsed = now - self.phase_start_time
-            if elapsed < FORWARD_DURATION:
-                self.drive(FORWARD_SPEED, 0.0)
-            else:
-                self.stop()
-                self.log_leg_result(2, elapsed)
-                self.phase += 1
-                self.phase_start_time = None
-
-        # Phase 3 — Move to next run or finish
-        elif self.phase == 3:
-            if self.current_run < NUM_RUNS:
                 self.current_run += 1
                 self.phase = 0
                 self.get_logger().info(
                     f'Starting run {self.current_run}/{NUM_RUNS}')
-            else:
-                self.stop()
-                self.get_logger().info('Test sequence complete — stopping')
-                self.test_done = True
 
-    def log_leg_result(self, leg_number, elapsed):
+    def buttons_callback(self, msg):
+        button_state = None
+        if hasattr(msg, 'create3_2'):
+            button_state = getattr(msg, 'create3_2')
+        elif hasattr(msg, 'button_2'):
+            button_state = getattr(msg, 'button_2')
+        elif hasattr(msg, 'button2'):
+            button_state = getattr(msg, 'button2')
+
+        if button_state is None:
+            return
+
+        is_pressed = (
+            bool(button_state.is_pressed)
+            if hasattr(button_state, 'is_pressed')
+            else bool(button_state)
+        )
+        if is_pressed and not self.last_button2_pressed and self.phase == 1:
+            self.pending_next_run = True
+            self.get_logger().info('Received create3_2 press: scheduling turn + next run')
+        self.last_button2_pressed = is_pressed
+
+    def log_leg_result(self, elapsed):
         distance = math.hypot(
             self.current_x - self.leg_start_x,
             self.current_y - self.leg_start_y)
         self.log_counter += 1
         ros_time_ns = self.get_clock().now().nanoseconds
         log_file = self.log_dir / (
-            f'run_{self.current_run}_leg_{leg_number}_{ros_time_ns}_{self.log_counter}.log')
+            f'run_{self.current_run}_{ros_time_ns}_{self.log_counter}.log')
         with log_file.open('w', encoding='utf-8') as handle:
             handle.write(f'run={self.current_run}\n')
-            handle.write(f'leg={leg_number}\n')
             handle.write(f'duration_s={elapsed:.3f}\n')
             handle.write(f'start_x={self.leg_start_x:.4f}\n')
             handle.write(f'start_y={self.leg_start_y:.4f}\n')
@@ -218,7 +237,7 @@ class TestNode(Node):
             handle.write(f'final_yaw_deg={self.current_yaw:.2f}\n')
             handle.write(f'nearest_obstacle_m={self.nearest_obstacle:.4f}\n')
         self.get_logger().info(
-            f'Run {self.current_run} Leg {leg_number} complete | '
+            f'Run {self.current_run} complete | '
             f'Distance: {distance:.4f} m | Log: {log_file}')
 
 
