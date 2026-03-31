@@ -26,6 +26,8 @@ source ~/732RoomberGoomber/ros2_ws/install/setup.bash
 ### Running odometry logger
 temrinal 1:
 ```bash
+source ~/732RoomberGoomber/ros2_ws/install/setup.bash
+source /opt/ros/humble/setup.bash
 ~/ros2_venv/bin/python3 ~/732RoomberGoomber/ros2_ws/src/lab_scripts/odom_logger.py --namespace /TXX --mode linear --target 1.0 --duration 30 --trial 1
 ```
 

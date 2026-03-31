@@ -27,6 +27,7 @@ NAMESPACE = '/T11'           # Change to your robot e.g. /T10
 # ── TODO: Define your motion parameters ────────────────────────────────────────
 FORWARD_SPEED = 0.1          # m/s  — linear velocity when driving forward
 TURN_SPEED    = 0.5          # rad/s — angular velocity when turning
+TIME          = 10          # seconds — duration to drive forward in phase 0
 # Example durations for known distances/angles:
 #   Drive 1.0 m at 0.2 m/s  → duration = 1.0 / 0.2 = 5.0 seconds
 #   Turn 90°  at 0.5 rad/s  → duration = (pi/2) / 0.5 = 3.14 seconds
@@ -124,17 +125,15 @@ class TestNode(Node):
             self.stop()
             return
 
-        now = self.get_clock().now().nanoseconds / 1e9   # current time in seconds
+        now = self.get_clock().now().nanoseconds / 1e9
 
-        # ── TODO: Replace the example sequence below with your own ───────────
-
-        # Phase 0 — Drive forward for 5 seconds (≈ 1 m at 0.2 m/s)
+        # Phase 0 — Drive forward
         if self.phase == 0:
             if self.phase_start_time is None:
                 self.phase_start_time = now
                 self.get_logger().info('Phase 0: Driving forward')
             elapsed = now - self.phase_start_time
-            if elapsed < 5.0:
+            if elapsed < TIME:
                 self.drive(FORWARD_SPEED, 0.0)
             else:
                 self.stop()
@@ -144,33 +143,14 @@ class TestNode(Node):
                 self.phase += 1
                 self.phase_start_time = None
 
-        # Phase 1 — Turn 90 degrees (π/2 rad at TURN_SPEED rad/s)
+        # Phase 1 — Test complete
         elif self.phase == 1:
-            turn_duration = (math.pi / 2) / TURN_SPEED
-            if self.phase_start_time is None:
-                self.phase_start_time = now
-                self.get_logger().info('Phase 1: Turning 90 degrees')
-            elapsed = now - self.phase_start_time
-            if elapsed < turn_duration:
-                self.drive(0.0, TURN_SPEED)
-            else:
-                self.stop()
-                self.get_logger().info(
-                    f'Phase 1 complete | Heading: {self.current_yaw:.2f} deg')
-                self.phase += 1
-                self.phase_start_time = None
-
-        # Phase 2 — Test complete
-        elif self.phase == 2:
             self.stop()
             self.get_logger().info('Test sequence complete — stopping')
             self.get_logger().info(
                 f'Final pose: x={self.current_x:.4f}  y={self.current_y:.4f}  '
                 f'yaw={self.current_yaw:.2f} deg')
             self.test_done = True
-
-        # ── TODO: Add more phases for your specific test ──────────────────────
-
 
 def main(args=None):
     rclpy.init(args=args)
