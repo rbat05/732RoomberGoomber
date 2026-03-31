@@ -2,8 +2,8 @@
 
 ### Env setup
 ```bash
-source /opt/ros/humble/setup.bash
 source ~/732RoomberGoomber/ros2_ws/install/setup.bash
+source /opt/ros/humble/setup.bash
 ```
 
 ### Prereq
@@ -32,5 +32,6 @@ temrinal 1:
 terminal 2:
 ```bash
 source ~/732RoomberGoomber/ros2_ws/install/setup.bash
+source /opt/ros/humble/setup.bash
 ros2 run tb4_sensor_reader test_node
 ```
