@@ -27,8 +27,8 @@ from irobot_create_msgs.msg import InterfaceButtons
 NAMESPACE = '/T11'           # Change to your robot e.g. /T10
 
 # ── TODO: Define your motion parameters ────────────────────────────────────────
-FORWARD_SPEED = 0.1          # m/s  — linear velocity when driving forward
-TURN_SPEED    = 0.5          # rad/s — angular velocity when turning
+FORWARD_SPEED = 0.2          # m/s  — linear velocity when driving forward
+TURN_SPEED    = 0.25          # rad/s — angular velocity when turning
 FORWARD_DURATION = 5.0       # seconds to drive for each straight-line test
 NUM_RUNS = 5                 # number of straight-line runs to perform
 # Example durations for known distances/angles:
@@ -62,7 +62,7 @@ class TestNode(Node):
             10)
         self.button_sub = self.create_subscription(
             InterfaceButtons,
-            '/hmi/buttons',
+            f'{NAMESPACE}/hmi/buttons',
             self.buttons_callback,
             10)
 
@@ -205,6 +205,8 @@ class TestNode(Node):
             button_state = getattr(msg, 'button2')
 
         if button_state is None:
+            self.get_logger().info(
+                    f'Button 2 FAILED TO REGISTER')
             return
 
         is_pressed = (
