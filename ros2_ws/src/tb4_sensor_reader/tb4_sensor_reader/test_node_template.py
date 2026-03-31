@@ -185,7 +185,7 @@ class TestNode(Node):
             if self.phase_start_time is None:
                 self.phase_start_time = now
                 self.get_logger().info(
-                    f'Run {self.current_run + 1}/{NUM_RUNS} | Turning 180 degrees')
+                    f'Preparing run {self.current_run + 1}/{NUM_RUNS} | Turning 180 degrees')
             elapsed = now - self.phase_start_time
             if elapsed < self.turn_duration:
                 self.drive(0.0, TURN_SPEED)
@@ -193,8 +193,7 @@ class TestNode(Node):
                 self.stop()
                 self.current_run += 1
                 self.phase = 0
-                self.get_logger().info(
-                    f'Starting run {self.current_run}/{NUM_RUNS}')
+                self.phase_start_time = None
 
     def buttons_callback(self, msg):
         button_state = None
