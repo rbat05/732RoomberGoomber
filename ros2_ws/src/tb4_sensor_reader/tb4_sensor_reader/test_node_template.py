@@ -16,7 +16,6 @@ To run:
 
 import rclpy
 import math
-from datetime import datetime
 from pathlib import Path
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -204,9 +203,9 @@ class TestNode(Node):
             self.current_x - self.leg_start_x,
             self.current_y - self.leg_start_y)
         self.log_counter += 1
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        ros_time_ns = self.get_clock().now().nanoseconds
         log_file = self.log_dir / (
-            f'run_{self.current_run}_leg_{leg_number}_{timestamp}_{self.log_counter}.log')
+            f'run_{self.current_run}_leg_{leg_number}_{ros_time_ns}_{self.log_counter}.log')
         with log_file.open('w', encoding='utf-8') as handle:
             handle.write(f'run={self.current_run}\n')
             handle.write(f'leg={leg_number}\n')
