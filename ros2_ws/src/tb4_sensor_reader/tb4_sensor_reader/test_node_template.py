@@ -77,7 +77,6 @@ class TestNode(Node):
         self.leg_start_x = 0.0
         self.leg_start_y = 0.0
         self.turn_duration = math.pi / TURN_SPEED   # 180° turn
-        self.log_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.log_dir = Path.cwd() / 'straight_line_logs'
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -203,8 +202,9 @@ class TestNode(Node):
         distance = math.hypot(
             self.current_x - self.leg_start_x,
             self.current_y - self.leg_start_y)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         log_file = self.log_dir / (
-            f'run_{self.current_run}_leg_{leg_number}_{self.log_timestamp}.log')
+            f'run_{self.current_run}_leg_{leg_number}_{timestamp}.log')
         with log_file.open('w', encoding='utf-8') as handle:
             handle.write(f'run={self.current_run}\n')
             handle.write(f'leg={leg_number}\n')
