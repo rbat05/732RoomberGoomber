@@ -16,6 +16,8 @@ To run:
 
 import rclpy
 import math
+from datetime import datetime
+from pathlib import Path
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -27,6 +29,8 @@ NAMESPACE = '/T11'           # Change to your robot e.g. /T10
 # ── TODO: Define your motion parameters ────────────────────────────────────────
 FORWARD_SPEED = 0.1          # m/s  — linear velocity when driving forward
 TURN_SPEED    = 0.5          # rad/s — angular velocity when turning
+FORWARD_DURATION = 5.0       # seconds to drive for each straight-line test
+NUM_RUNS = 5                 # each run performs 2 straight-line tests
 # Example durations for known distances/angles:
 #   Drive 1.0 m at 0.2 m/s  → duration = 1.0 / 0.2 = 5.0 seconds
 #   Turn 90°  at 0.5 rad/s  → duration = (pi/2) / 0.5 = 3.14 seconds
@@ -69,6 +73,13 @@ class TestNode(Node):
         self.phase     = 0
         self.phase_start_time = None
         self.test_done = False
+        self.current_run = 1
+        self.leg_start_x = 0.0
+        self.leg_start_y = 0.0
+        self.turn_duration = math.pi / TURN_SPEED   # 180° turn
+        self.log_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_dir = Path.cwd() / 'straight_line_logs'
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         # ── Control loop timer (runs every 0.1 seconds = 10 Hz) ─────────────
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -126,50 +137,88 @@ class TestNode(Node):
 
         now = self.get_clock().now().nanoseconds / 1e9   # current time in seconds
 
-        # ── TODO: Replace the example sequence below with your own ───────────
+        # ── Straight-line distance sequence (5 runs, 2 legs per run) ─────────
 
-        # Phase 0 — Drive forward for 5 seconds (≈ 1 m at 0.2 m/s)
+        # Phase 0 — Drive forward (leg 1)
         if self.phase == 0:
             if self.phase_start_time is None:
                 self.phase_start_time = now
-                self.get_logger().info('Phase 0: Driving forward')
+                self.leg_start_x = self.current_x
+                self.leg_start_y = self.current_y
+                self.get_logger().info(
+                    f'Run {self.current_run}/{NUM_RUNS} | Leg 1: Driving forward')
             elapsed = now - self.phase_start_time
-            if elapsed < 5.0:
+            if elapsed < FORWARD_DURATION:
                 self.drive(FORWARD_SPEED, 0.0)
             else:
                 self.stop()
-                self.get_logger().info(
-                    f'Phase 0 complete | '
-                    f'Final position x: {self.current_x:.4f} m  y: {self.current_y:.4f} m')
+                self.log_leg_result(1, elapsed)
                 self.phase += 1
                 self.phase_start_time = None
 
-        # Phase 1 — Turn 90 degrees (π/2 rad at TURN_SPEED rad/s)
+        # Phase 1 — Turn around 180 degrees
         elif self.phase == 1:
-            turn_duration = (math.pi / 2) / TURN_SPEED
             if self.phase_start_time is None:
                 self.phase_start_time = now
-                self.get_logger().info('Phase 1: Turning 90 degrees')
+                self.get_logger().info(
+                    f'Run {self.current_run}/{NUM_RUNS} | Turning 180 degrees')
             elapsed = now - self.phase_start_time
-            if elapsed < turn_duration:
+            if elapsed < self.turn_duration:
                 self.drive(0.0, TURN_SPEED)
             else:
                 self.stop()
-                self.get_logger().info(
-                    f'Phase 1 complete | Heading: {self.current_yaw:.2f} deg')
                 self.phase += 1
                 self.phase_start_time = None
 
-        # Phase 2 — Test complete
+        # Phase 2 — Drive forward (leg 2)
         elif self.phase == 2:
-            self.stop()
-            self.get_logger().info('Test sequence complete — stopping')
-            self.get_logger().info(
-                f'Final pose: x={self.current_x:.4f}  y={self.current_y:.4f}  '
-                f'yaw={self.current_yaw:.2f} deg')
-            self.test_done = True
+            if self.phase_start_time is None:
+                self.phase_start_time = now
+                self.leg_start_x = self.current_x
+                self.leg_start_y = self.current_y
+                self.get_logger().info(
+                    f'Run {self.current_run}/{NUM_RUNS} | Leg 2: Driving forward')
+            elapsed = now - self.phase_start_time
+            if elapsed < FORWARD_DURATION:
+                self.drive(FORWARD_SPEED, 0.0)
+            else:
+                self.stop()
+                self.log_leg_result(2, elapsed)
+                self.phase += 1
+                self.phase_start_time = None
 
-        # ── TODO: Add more phases for your specific test ──────────────────────
+        # Phase 3 — Move to next run or finish
+        elif self.phase == 3:
+            if self.current_run < NUM_RUNS:
+                self.current_run += 1
+                self.phase = 0
+                self.get_logger().info(
+                    f'Starting run {self.current_run}/{NUM_RUNS}')
+            else:
+                self.stop()
+                self.get_logger().info('Test sequence complete — stopping')
+                self.test_done = True
+
+    def log_leg_result(self, leg_number, elapsed):
+        distance = math.hypot(
+            self.current_x - self.leg_start_x,
+            self.current_y - self.leg_start_y)
+        log_file = self.log_dir / (
+            f'run_{self.current_run}_leg_{leg_number}_{self.log_timestamp}.log')
+        with log_file.open('w', encoding='utf-8') as handle:
+            handle.write(f'run={self.current_run}\n')
+            handle.write(f'leg={leg_number}\n')
+            handle.write(f'duration_s={elapsed:.3f}\n')
+            handle.write(f'start_x={self.leg_start_x:.4f}\n')
+            handle.write(f'start_y={self.leg_start_y:.4f}\n')
+            handle.write(f'end_x={self.current_x:.4f}\n')
+            handle.write(f'end_y={self.current_y:.4f}\n')
+            handle.write(f'distance_m={distance:.4f}\n')
+            handle.write(f'final_yaw_deg={self.current_yaw:.2f}\n')
+            handle.write(f'nearest_obstacle_m={self.nearest_obstacle:.4f}\n')
+        self.get_logger().info(
+            f'Run {self.current_run} Leg {leg_number} complete | '
+            f'Distance: {distance:.4f} m | Log: {log_file}')
 
 
 def main(args=None):
