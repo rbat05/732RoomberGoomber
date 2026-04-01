@@ -8,6 +8,8 @@ source /opt/ros/humble/setup.bash
 
 ### Prereq
 ```bash
+set-turtlebot XX
+sanity
 ros2 action send_goal /TXX/undock irobot_create_msgs/action/Undock {}
 ```
 

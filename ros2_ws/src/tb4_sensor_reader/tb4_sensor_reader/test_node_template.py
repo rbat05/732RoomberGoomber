@@ -22,12 +22,12 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 
 # ── TODO: Set your robot namespace ─────────────────────────────────────────────
-NAMESPACE = '/T11'           # Change to your robot e.g. /T10
+NAMESPACE = '/T23'           # Change to your robot e.g. /T10
 
 # ── TODO: Define your motion parameters ────────────────────────────────────────
-FORWARD_SPEED = 0.1          # m/s  — linear velocity when driving forward
+FORWARD_SPEED = 0.3          # m/s  — linear velocity when driving forward
 TURN_SPEED    = 0.5          # rad/s — angular velocity when turning
-TIME          = 10          # seconds — duration to drive forward in phase 0
+TIME          = 16.667          # seconds — duration to drive forward in phase 0
 # Example durations for known distances/angles:
 #   Drive 1.0 m at 0.2 m/s  → duration = 1.0 / 0.2 = 5.0 seconds
 #   Turn 90°  at 0.5 rad/s  → duration = (pi/2) / 0.5 = 3.14 seconds

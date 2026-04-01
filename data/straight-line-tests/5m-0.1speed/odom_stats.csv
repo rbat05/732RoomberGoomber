@@ -1,0 +1,4 @@
+mode,target_m,displacement_m,error_m,error_pct,heading_error_deg,samples
+linear,5.0,4.8201,-0.1799,3.6,0.81,1089
+linear,5.0,4.8759,-0.1241,2.48,0.89,1089
+linear,5.0,4.9952,-0.0048,0.1,1.68,1089
