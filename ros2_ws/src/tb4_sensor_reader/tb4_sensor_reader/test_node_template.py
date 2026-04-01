@@ -1,37 +1,35 @@
 #!/usr/bin/env python3
 """
-Test Node Template — Sensor Investigation
+Test Node — Square Path
 COMPSYS732
 
-Use this template as the starting point for your autonomous test nodes.
-It combines the publisher pattern from Task 5 (to command motion) with
-the subscriber pattern from Task 4 (to read sensor data).
-
-Fill in the sections marked TODO to implement your specific test.
+Drives the robot in a 1 m x 1 m square (four sides, four 90° left turns)
+and logs the closing error at the end.  Compatible with odom_logger.py in
+--mode square.
 
 To run:
     ros2 run tb4_sensor_reader test_node
-    (after adding 'test_node = tb4_sensor_reader.test_node:main' to setup.py)
+    (add 'test_node = tb4_sensor_reader.test_node:main' to setup.py)
 """
 
-import rclpy
 import math
+import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 
-# ── TODO: Set your robot namespace ─────────────────────────────────────────────
+# ── Robot namespace ────────────────────────────────────────────────────────────
 NAMESPACE = '/T23'           # Change to your robot e.g. /T10
 
-# ── TODO: Define your motion parameters ────────────────────────────────────────
-FORWARD_SPEED = 0.3          # m/s  — linear velocity when driving forward
-TURN_SPEED    = 0.5          # rad/s — angular velocity when turning
-TIME          = 16.667          # seconds — duration to drive forward in phase 0
-# Example durations for known distances/angles:
-#   Drive 1.0 m at 0.2 m/s  → duration = 1.0 / 0.2 = 5.0 seconds
-#   Turn 90°  at 0.5 rad/s  → duration = (pi/2) / 0.5 = 3.14 seconds
-#   Turn 360° at 0.5 rad/s  → duration = (2*pi) / 0.5 = 12.57 seconds
+# ── Motion parameters ──────────────────────────────────────────────────────────
+SIDE_LENGTH   = 1.0          # metres — length of each square side
+FORWARD_SPEED = 0.1          # m/s   — linear velocity when driving straight
+TURN_SPEED    = 0.5          # rad/s — angular velocity when turning left
+
+# ── Derived durations (do not edit these) ─────────────────────────────────────
+DRIVE_TIME = SIDE_LENGTH / FORWARD_SPEED          # seconds to cover one side
+TURN_TIME  = (math.pi / 2.0) / TURN_SPEED        # seconds for a 90° left turn
 
 
 class TestNode(Node):
@@ -58,47 +56,46 @@ class TestNode(Node):
             self.scan_callback,
             10)
 
-        # ── State variables ──────────────────────────────────────────────────
-        # These store the latest sensor readings so any callback can use them
-        self.current_x   = 0.0
-        self.current_y   = 0.0
-        self.current_yaw = 0.0   # degrees
-        self.nearest_obstacle = float('inf')   # metres
+        # ── Sensor state ─────────────────────────────────────────────────────
+        self.current_x        = 0.0
+        self.current_y        = 0.0
+        self.current_yaw      = 0.0   # degrees
+        self.nearest_obstacle = float('inf')  # metres
 
-        # ── TODO: Add your own state variables ───────────────────────────────
-        # Example: track which phase of your test sequence you are in
-        self.phase     = 0
+        # ── Sequence state ───────────────────────────────────────────────────
+        # Phases 0, 2, 4, 6 → drive forward one side
+        # Phases 1, 3, 5, 7 → turn left 90°
+        # Phase 8            → done
+        self.phase            = 0
         self.phase_start_time = None
-        self.test_done = False
+        self.test_done        = False
 
-        # ── Control loop timer (runs every 0.1 seconds = 10 Hz) ─────────────
+        # ── Control loop (10 Hz) ─────────────────────────────────────────────
         self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.get_logger().info('Test node started')
+        self.get_logger().info(
+            f'Square test node started — side={SIDE_LENGTH} m  '
+            f'drive={DRIVE_TIME:.2f}s  turn={TURN_TIME:.2f}s')
 
-    # ── Odometry callback ────────────────────────────────────────────────────
+    # ── Callbacks ────────────────────────────────────────────────────────────
 
     def odom_callback(self, msg):
         pos = msg.pose.pose.position
         self.current_x = pos.x
         self.current_y = pos.y
 
-        # Convert quaternion to yaw in degrees
         q = msg.pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
 
-    # ── LiDAR callback ───────────────────────────────────────────────────────
-
     def scan_callback(self, msg):
         valid = [r for r in msg.ranges if msg.range_min <= r <= msg.range_max]
         self.nearest_obstacle = min(valid) if valid else float('inf')
 
-    # ── Helper: publish a velocity command ───────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def drive(self, linear, angular):
-        """Publish a Twist command. Call with (0, 0) to stop."""
         msg = Twist()
         msg.linear.x  = float(linear)
         msg.angular.z = float(angular)
@@ -107,50 +104,70 @@ class TestNode(Node):
     def stop(self):
         self.drive(0.0, 0.0)
 
+    def _start_phase(self, label):
+        """Record the start time for a new phase and log it."""
+        self.phase_start_time = self.get_clock().now().nanoseconds / 1e9
+        self.get_logger().info(label)
+
     # ── Control loop ─────────────────────────────────────────────────────────
 
     def control_loop(self):
-        """
-        Called at 10 Hz. Implement your test sequence here using self.phase
-        to track which step of the sequence you are in.
-
-        Pattern:
-            Phase 0 → do action A for N seconds → advance to phase 1
-            Phase 1 → do action B for N seconds → advance to phase 2
-            ...
-            Final phase → stop, log results, set self.test_done = True
-        """
-
         if self.test_done:
             self.stop()
             return
 
-        now = self.get_clock().now().nanoseconds / 1e9
+        now     = self.get_clock().now().nanoseconds / 1e9
+        elapsed = (now - self.phase_start_time) if self.phase_start_time is not None else 0.0
 
-        # Phase 0 — Drive forward
-        if self.phase == 0:
+        # ── Drive phases (0, 2, 4, 6) ────────────────────────────────────────
+        if self.phase in (0, 2, 4, 6):
+            side_num = self.phase // 2 + 1          # 1-based label
+
             if self.phase_start_time is None:
-                self.phase_start_time = now
-                self.get_logger().info('Phase 0: Driving forward')
-            elapsed = now - self.phase_start_time
-            if elapsed < TIME:
+                self._start_phase(f'Phase {self.phase}: driving side {side_num}')
+
+            if elapsed < DRIVE_TIME:
                 self.drive(FORWARD_SPEED, 0.0)
             else:
                 self.stop()
                 self.get_logger().info(
-                    f'Phase 0 complete | '
-                    f'Final position x: {self.current_x:.4f} m  y: {self.current_y:.4f} m')
+                    f'Phase {self.phase} complete | '
+                    f'x={self.current_x:.4f}  y={self.current_y:.4f}  '
+                    f'yaw={self.current_yaw:.2f} deg')
                 self.phase += 1
                 self.phase_start_time = None
 
-        # Phase 1 — Test complete
-        elif self.phase == 1:
+        # ── Turn phases (1, 3, 5, 7) ─────────────────────────────────────────
+        elif self.phase in (1, 3, 5, 7):
+            turn_num = (self.phase + 1) // 2       # 1-based label
+
+            if self.phase_start_time is None:
+                self._start_phase(f'Phase {self.phase}: turning left (corner {turn_num})')
+
+            if elapsed < TURN_TIME:
+                self.drive(0.0, TURN_SPEED)         # positive = counter-clockwise
+            else:
+                self.stop()
+                self.get_logger().info(
+                    f'Phase {self.phase} complete | '
+                    f'yaw={self.current_yaw:.2f} deg')
+                self.phase += 1
+                self.phase_start_time = None
+
+        # ── Done ──────────────────────────────────────────────────────────────
+        elif self.phase == 8:
             self.stop()
-            self.get_logger().info('Test sequence complete — stopping')
+            closing_error = math.sqrt(self.current_x ** 2 + self.current_y ** 2)
+            self.get_logger().info('═' * 50)
+            self.get_logger().info('Square path complete')
             self.get_logger().info(
-                f'Final pose: x={self.current_x:.4f}  y={self.current_y:.4f}  '
+                f'Final pose  x={self.current_x:.4f} m  '
+                f'y={self.current_y:.4f} m  '
                 f'yaw={self.current_yaw:.2f} deg')
+            self.get_logger().info(f'Closing error: {closing_error:.4f} m')
+            self.get_logger().info('═' * 50)
             self.test_done = True
+
 
 def main(args=None):
     rclpy.init(args=args)
