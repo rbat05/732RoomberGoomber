@@ -23,8 +23,8 @@ from sensor_msgs.msg import LaserScan
 NAMESPACE = '/T23'           # Change to your robot e.g. /T10
 
 # ── Motion parameters ──────────────────────────────────────────────────────────
-SIDE_LENGTH   = 1.0          # metres — length of each square side
-FORWARD_SPEED = 0.1          # m/s   — linear velocity when driving straight
+SIDE_LENGTH   = 0.5          # metres — length of each square side
+FORWARD_SPEED = 0.3          # m/s   — linear velocity when driving straight
 TURN_SPEED    = 0.5          # rad/s — angular velocity when turning left
 
 # ── Derived durations (do not edit these) ─────────────────────────────────────
