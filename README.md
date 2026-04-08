@@ -8,14 +8,14 @@ source /opt/ros/humble/setup.bash
 
 ### Prereq
 ```bash
-set-turtlebot 23
+set-turtlebot 21
 sanity
-ros2 action send_goal /T23/undock irobot_create_msgs/action/Undock {}
+ros2 action send_goal /T21/undock irobot_create_msgs/action/Undock {}
 ```
 
 Check after 20 sec
 ```bash
-ros2 topic list | grep T23
+ros2 topic list | grep T21
 ```
 
 ### Building
