@@ -173,7 +173,7 @@ class LidarLogger(Node):
             ranges, np.nan)
 
         fig, ax = plt.subplots(subplot_kw=dict(projection='polar'), figsize=(10, 10))
-        fig.suptitle('LiDAR Scan Snapshot — TurtleBot 4\n(180° = forward / camera side)',
+        fig.suptitle('LiDAR Scan Snapshot — TurtleBot 4\n(270° = forward / camera side)',
                      fontsize=14, fontweight='bold')
         ax.scatter(angles, ranges_clean, s=1.5, c='#E74C3C', alpha=0.7)
         ax.plot(angles, ranges_clean, color='#2980B9', linewidth=0.5, alpha=0.4)

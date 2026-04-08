@@ -53,3 +53,9 @@ ros2 run tb4_sensor_reader test_node
 ```bash
 ros2 service call /T23/reset_pose irobot_create_msgs/srv/ResetPose
 ```
+
+```bash
+source ~/732RoomberGoomber/ros2_ws/install/setup.bash &&
+source /opt/ros/humble/setup.bash &&
+ros2 run tb4_sensor_reader test_node
+```
