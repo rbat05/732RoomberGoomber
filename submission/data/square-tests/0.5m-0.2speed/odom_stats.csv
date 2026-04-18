@@ -1,0 +1,6 @@
+mode,closing_error_m,final_x,final_y,heading_error_deg,samples
+square,0.1322,-0.1321,0.0048,1.71,590
+square,0.1285,-0.1283,0.0064,2.98,589
+square,0.1162,-0.1162,0.001,5.31,589
+square,0.1062,-0.1058,0.0095,2.87,589
+square,0.1451,-0.1451,-0.0017,7.47,589
