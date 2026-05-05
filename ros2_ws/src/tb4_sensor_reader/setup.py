@@ -25,6 +25,7 @@ setup(
         	'reactive_controller = tb4_sensor_reader.reactive_controller:main',
         	'avoid_controller = tb4_sensor_reader.avoid_controller:main',
         	'test_node = tb4_sensor_reader.lidar_snapshot:main',
+            'pose_reader = tb4_sensor_reader.pose_reader:main',
         ],
     },
 )
