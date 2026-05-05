@@ -26,6 +26,9 @@ setup(
         	'avoid_controller = tb4_sensor_reader.avoid_controller:main',
         	'test_node = tb4_sensor_reader.lidar_snapshot:main',
             'pose_reader = tb4_sensor_reader.pose_reader:main',
+            'physical_motion = tb4_sensor_reader.physical_motion:main',
+            'reactive_physical = tb4_sensor_reader.reactive_physical:main',
+            'avoidance_physical = tb4_sensor_reader.avoidance_physical:main',
         ],
     },
 )
