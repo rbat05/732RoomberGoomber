@@ -29,6 +29,9 @@ setup(
             'physical_motion = tb4_sensor_reader.physical_motion:main',
             'reactive_physical = tb4_sensor_reader.reactive_physical:main',
             'avoidance_physical = tb4_sensor_reader.avoidance_physical:main',
+            'camera_viewer = tb4_sensor_reader.camera_viewer:main',
+            'camera_detector = tb4_sensor_reader.camera_detector:main',
+            'detect_and_stop = tb4_sensor_reader.detect_and_stop:main',
         ],
     },
 )
