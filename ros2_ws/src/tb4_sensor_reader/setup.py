@@ -32,6 +32,7 @@ setup(
             'camera_viewer = tb4_sensor_reader.camera_viewer:main',
             'camera_detector = tb4_sensor_reader.camera_detector:main',
             'detect_and_stop = tb4_sensor_reader.detect_and_stop:main',
+            'proj2_movement=tb4_sensor_reader.proj2_movement:main',
         ],
     },
 )

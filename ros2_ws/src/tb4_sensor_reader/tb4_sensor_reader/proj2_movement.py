@@ -6,17 +6,19 @@ from sensor_msgs.msg import LaserScan, CompressedImage
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 
-NAMESPACE      = '/T23'    # ← change to your robot namespace
-FORWARD_SPEED  = 0.15
-TURN_SPEED     = 0.5
-AVOID_DISTANCE = 0.55
-FRONT_ARC_DEG  = 60
+NAMESPACE        = '/T23'
+FORWARD_SPEED    = 0.15
+TURN_SPEED       = 0.5
+AVOID_DISTANCE   = 0.55
+FRONT_ARC_DEG    = 60
+LIDAR_OFFSET_DEG = -90
+LIDAR_OFFSET_RAD = math.radians(LIDAR_OFFSET_DEG)
 
 RED_LOW1  = np.array([0,   120, 70])
 RED_HIGH1 = np.array([10,  255, 255])
 RED_LOW2  = np.array([170, 120, 70])
 RED_HIGH2 = np.array([180, 255, 255])
-MIN_PIXELS = 5000           # ← use your calibrated value
+MIN_PIXELS = 5000
 
 class DetectAndStop(Node):
     def __init__(self):
@@ -34,7 +36,7 @@ class DetectAndStop(Node):
         self.create_subscription(
             Odometry, f'{NAMESPACE}/odom',
             self.odom_callback, 10)
-        # Shared state
+
         self.nearest_front = float('inf')
         self.nearest_left  = float('inf')
         self.nearest_right = float('inf')
@@ -49,15 +51,18 @@ class DetectAndStop(Node):
         inc     = msg.angle_increment
         arc_r   = math.radians(FRONT_ARC_DEG)
         side_r  = math.radians(90)
-        front_i = int(round(-msg.angle_min / inc))
+        # ← offset-corrected front index
+        front_i = int(round((LIDAR_OFFSET_RAD - msg.angle_min) / inc))
         half_a  = int(round(arc_r  / inc))
         side_a  = int(round(side_r / inc))
         n       = len(msg.ranges)
+
         def arc_min(lo, hi):
             lo = max(0, lo); hi = min(n - 1, hi)
             vals = [r for r in msg.ranges[lo:hi+1]
                     if msg.range_min < r < msg.range_max]
             return min(vals) if vals else float('inf')
+
         self.nearest_front = arc_min(front_i - half_a, front_i + half_a)
         self.nearest_left  = arc_min(front_i,          front_i + side_a)
         self.nearest_right = arc_min(front_i - side_a, front_i)
@@ -68,7 +73,7 @@ class DetectAndStop(Node):
 
     def image_callback(self, msg):
         if self.state != 'SEARCHING':
-            return   # no need to process once found
+            return
         img  = self.bridge.compressed_imgmsg_to_cv2(msg, 'bgr8')
         hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         mask = cv2.bitwise_or(
@@ -83,26 +88,33 @@ class DetectAndStop(Node):
     def control_loop(self):
         if self.state == 'DONE':
             return
+
         if self.state == 'SEARCHING':
             if self.cube_detected:
                 self.state = 'DETECTED'
                 self.stop()
-                # Log position at moment of detection
-                self.get_logger().info(
-                    f'RED CUBE DETECTED — stopping')
+                self.get_logger().info('RED CUBE DETECTED — stopping')
                 self.get_logger().info(
                     f'Detected position: x={self.current_x:.3f} m  y={self.current_y:.3f} m')
                 return
+
             cmd = Twist()
             if self.nearest_front > AVOID_DISTANCE:
                 cmd.linear.x  = FORWARD_SPEED
                 cmd.angular.z = 0.0
+                self.get_logger().info(
+                    f'Fwd | front={self.nearest_front:.2f} m | '
+                    f'pos=({self.current_x:.2f}, {self.current_y:.2f})')
             else:
                 cmd.linear.x = 0.0
-                cmd.angular.z = (TURN_SPEED if
-                    self.nearest_left >= self.nearest_right
-                    else -TURN_SPEED)
+                if self.nearest_left >= self.nearest_right:
+                    cmd.angular.z = TURN_SPEED
+                    self.get_logger().warn('Obstacle — turning LEFT')
+                else:
+                    cmd.angular.z = -TURN_SPEED
+                    self.get_logger().warn('Obstacle — turning RIGHT')
             self.pub.publish(cmd)
+
         elif self.state == 'DETECTED':
             self.stop()
             self.state = 'DONE'
