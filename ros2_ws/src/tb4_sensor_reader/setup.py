@@ -35,6 +35,7 @@ setup(
             'proj2_movement=tb4_sensor_reader.proj2_movement:main',
             'ctest_odom=tb4_sensor_reader.ctest_odom:main',
             'proj2_script=tb4_sensor_reader.proj2_script:main',
+            'proj2_script_gem=tb4_sensor_reader.proj2_script_gem:main',
         ],
     },
 )

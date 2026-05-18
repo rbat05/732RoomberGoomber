@@ -35,7 +35,7 @@ RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 # ── Obstacle avoidance ─────────────────────────────────────────────────────────
 AVOID_DISTANCE      = 0.30   # m — obstacle trigger distance
 AVOID_CLEAR_DIST    = 0.30   # m — must be clear before resuming navigation
-FRONT_ARC_DEG       = 1     # degrees — front detection arc width
+FRONT_ARC_DEG       = 1      # degrees — front detection arc width
 LIDAR_OFFSET_DEG    = -90    # degrees — LiDAR mounting offset
 LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
 
@@ -65,11 +65,11 @@ PGM_MAP_PATH = os.path.expanduser('~/Desktop/test_map.pgm')
 PGM_MAP_YAML = os.path.expanduser('~/Desktop/test_map.yaml')
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
-# Used only if PGM feature extraction or A* planning fails entirely.
+# SWAPPED X and Y
 MANUAL_WAYPOINTS = [
     (-2.3, -2.3),
-    (1.5, 0.5),
-    (1.5, 1.0),
+    (0.5, 1.5),
+    (1.0, 1.5),
 ]
 
 
@@ -182,30 +182,33 @@ def plan_path_on_map(pgm_path, yaml_path, start_world, goal_world):
             cv2.MORPH_ELLIPSE, (2 * radius_px + 1, 2 * radius_px + 1))
         inflated  = cv2.dilate(occupied, kernel)
 
+        # ── SWAPPED W2P AND P2W PER REQUEST ────────────────────────────────
         def w2p(wx, wy):
-            px = int((wx - origin[0]) / resolution)
-            py = int(h - (wy - origin[1]) / resolution)
+            # wx is actually the y-axis, wy is the x-axis
+            px = int((wy - origin[0]) / resolution)
+            py = int(h - (wx - origin[1]) / resolution)
             return max(0, min(w - 1, px)), max(0, min(h - 1, py))
 
         def p2w(px, py):
+            # Return (Y, X) mapped coordinates
             return (
-                round(origin[0] + px * resolution, 3),
-                round(origin[1] + (h - py) * resolution, 3))
+                round(origin[1] + (h - py) * resolution, 3), # X receives Y math
+                round(origin[0] + px * resolution, 3)        # Y receives X math
+            )
+        # ───────────────────────────────────────────────────────────────────
 
         start_px = w2p(*start_world)
         goal_px  = w2p(*goal_world)
 
-        # FORCE CLEAR a large starting zone (radius_px * 2) so A* can escape the tape mark
+        # Force clear a large starting zone (radius_px * 2) so A* can escape
         cv2.circle(inflated, start_px, radius_px * 2, 0, -1)
-        
-        # Clear the goal zone normally
         cv2.circle(inflated, goal_px, radius_px + 2, 0, -1)
+
         print(f'[ASTAR] start_px={start_px} goal_px={goal_px}  '
               f'start_free={inflated[start_px[1], start_px[0]]==0}  '
               f'goal_free={inflated[goal_px[1], goal_px[0]]==0}')
 
-        # ── Nudge goal if it lands inside an inflated obstacle ───────────────
-        # Search outward in a spiral until a free cell is found
+        # Nudge goal if it lands inside an inflated obstacle
         if inflated[goal_px[1], goal_px[0]] != 0:
             print(f'[ASTAR] Goal pixel is occupied — searching for nearest free cell')
             found = False
@@ -229,7 +232,7 @@ def plan_path_on_map(pgm_path, yaml_path, start_world, goal_world):
                 print('[ASTAR] Could not find free cell near goal — aborting')
                 return None
 
-        # ── Check start is free ──────────────────────────────────────────────
+        # Check start is free
         if inflated[start_px[1], start_px[0]] != 0:
             print(f'[ASTAR] Start pixel is occupied — cannot plan')
             return None
@@ -285,15 +288,8 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
         wall_area  = stats[wall_label, cv2.CC_STAT_AREA]
         print(f'[EXTRACT] Wall component: label={wall_label} area={wall_area}')
 
-        # Accept small isolated components — these are the cylinder blobs
-        # At 0.05 m/px a 12 cm cylinder = ~2.4 px diameter → area roughly 2–20 px
-        MIN_BLOB_AREA = 2
+        MIN_BLOB_AREA = 4
         MAX_BLOB_AREA = 30
-
-        # Accept small isolated components — these are the cylinder blobs
-        # At 0.05 m/px a 12 cm cylinder = ~2.4 px diameter 
-        MIN_BLOB_AREA = 4    # A 2x2 block is exactly 4 pixels. Reject 1-3 px noise.
-        MAX_BLOB_AREA = 30   # Reject large map artifacts (shoes, tripods, etc)
 
         waypoints = []
         for i in range(1, num_labels):
@@ -308,30 +304,28 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
             print(f'[EXTRACT]   Non-wall component {i}: area={area} dim={blob_w}x{blob_h} '
                   f'centroid=({cx:.1f},{cy:.1f})', end='')
                   
-            # 1. Area filtering (Stricter minimum)
             if area < MIN_BLOB_AREA or area > MAX_BLOB_AREA:
                 print(f' → rejected (area {area} out of bounds {MIN_BLOB_AREA}-{MAX_BLOB_AREA})')
                 continue
                 
-            # 2. Minimum Dimension filtering (Reject 1-pixel thin lines of noise)
             if blob_w < 2 or blob_h < 2:
                 print(f' → rejected (dimensions {blob_w}x{blob_h} too narrow)')
                 continue
                 
-            # 3. Aspect Ratio filtering (Must be roughly circular/square)
-            # A perfect cylinder blob should have an aspect ratio near 1.0
             aspect_ratio = float(blob_w) / float(blob_h)
             if aspect_ratio < 0.5 or aspect_ratio > 2.0:
                 print(f' → rejected (aspect ratio {aspect_ratio:.2f} not circular)')
                 continue
 
-            # If it passes all strict shape and area tests, record the coordinate
-            world_x = origin[0] + cx * resolution
-            world_y = origin[1] + (h - cy) * resolution
+            # ── SWAPPED WORLD X AND Y PER REQUEST ────────────────────────────
+            world_x = origin[1] + (h - cy) * resolution # X assigned the Y math
+            world_y = origin[0] + cx * resolution       # Y assigned the X math
+            # ─────────────────────────────────────────────────────────────────
+            
             waypoints.append((round(world_x, 3), round(world_y, 3)))
-            print(f' → accepted  world=({world_x:.3f},{world_y:.3f})')
+            print(f' → accepted  swapped_world=({world_x:.3f},{world_y:.3f})')
 
-        # ── Debug image ──────────────────────────────────────────────────────
+        # Debug image
         try:
             SCALE = 8
             debug_img = cv2.cvtColor(
@@ -339,8 +333,9 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
                            interpolation=cv2.INTER_NEAREST),
                 cv2.COLOR_GRAY2BGR)
             for (wx, wy) in waypoints:
-                px_d = int((wx - origin[0]) / resolution) * SCALE
-                py_d = int(h - (wy - origin[1]) / resolution) * SCALE
+                # Un-swap to draw correctly on the original map grid
+                px_d = int((wy - origin[0]) / resolution) * SCALE
+                py_d = int(h - (wx - origin[1]) / resolution) * SCALE
                 cv2.circle(debug_img, (px_d, py_d), 12, (0, 0, 255), 2)
                 cv2.circle(debug_img, (px_d, py_d),  3, (0, 0, 255), -1)
                 cv2.putText(debug_img, f'({wx:.2f},{wy:.2f})',
@@ -419,10 +414,6 @@ class AutonomousSearch(Node):
 
     # ── Waypoint loading ──────────────────────────────────────────────────────
 
-# ── Waypoint loading ──────────────────────────────────────────────────────
-
-    # ── Waypoint loading ──────────────────────────────────────────────────────
-
     def _load_waypoints(self):
         """
         Extract cylinder positions from PGM map, plan an A* path from (0,0)
@@ -478,59 +469,46 @@ class AutonomousSearch(Node):
             img = cv2.imread(PGM_MAP_PATH, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 h, w = img.shape
-                SCALE = 6  # Scale the image up 6x so it's easily readable
+                SCALE = 6
                 debug_img = cv2.cvtColor(
                     cv2.resize(img, (w * SCALE, h * SCALE), interpolation=cv2.INTER_NEAREST),
                     cv2.COLOR_GRAY2BGR)
 
-                # Helper to convert world (x,y) to scaled pixel (px, py)
                 def w2p_scaled(wx, wy):
-                    px = int((wx - origin[0]) / resolution)
-                    py = int(h - (wy - origin[1]) / resolution)
+                    # Un-swap to draw correctly on the original map image layout
+                    px = int((wy - origin[0]) / resolution)
+                    py = int(h - (wx - origin[1]) / resolution)
                     return (max(0, min(w - 1, px)) * SCALE, max(0, min(h - 1, py)) * SCALE)
 
-                # 1. Draw target cylinders in RED
                 for cyl in cylinders:
                     cv2.circle(debug_img, w2p_scaled(*cyl), 10, (0, 0, 255), -1)
 
-                # 2. Draw Robot Origin (0,0) and Local Coordinate Frame
                 origin_px = w2p_scaled(0.0, 0.0)
                 
-                # Robot X-axis (Forward) -> +0.4m in X. Drawn in RED (BGR: 0, 0, 255)
+                # Axes labels adapted to the swapped logic
                 x_axis_px = w2p_scaled(0.4, 0.0)
                 cv2.arrowedLine(debug_img, origin_px, x_axis_px, (0, 0, 255), 3, tipLength=0.2)
-                cv2.putText(debug_img, 'X', (x_axis_px[0] + 5, x_axis_px[1]), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(debug_img, 'X(Swapped)', (x_axis_px[0] + 5, x_axis_px[1]), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 
-                # Robot Y-axis (Left) -> +0.4m in Y. Drawn in GREEN (BGR: 0, 255, 0)
                 y_axis_px = w2p_scaled(0.0, 0.4)
                 cv2.arrowedLine(debug_img, origin_px, y_axis_px, (0, 255, 0), 3, tipLength=0.2)
-                cv2.putText(debug_img, 'Y', (y_axis_px[0] - 5, y_axis_px[1] - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(debug_img, 'Y(Swapped)', (y_axis_px[0] - 5, y_axis_px[1] - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
-                # Origin dot in BLUE
                 cv2.circle(debug_img, origin_px, 6, (255, 0, 0), -1)
 
-                # 3. Draw arrows along the full generated path in a distinct color (e.g. CYAN)
-                # (Changed from green so it doesn't blend with the Y-axis)
                 path_sequence = [(0.0, 0.0)] + full_path
                 for i in range(len(path_sequence) - 1):
                     pt1 = w2p_scaled(*path_sequence[i])
                     pt2 = w2p_scaled(*path_sequence[i+1])
-                    
-                    # Draw arrow line connecting the waypoints
                     cv2.arrowedLine(debug_img, pt1, pt2, (255, 255, 0), 2, tipLength=0.03)
-                    
-                    # Draw a small blue dot at each intermediate waypoint
                     cv2.circle(debug_img, pt2, 4, (255, 0, 0), -1)
 
-                # Save to disk
                 debug_path = os.path.expanduser('~/Desktop/path_debug.jpg')
                 ok = cv2.imwrite(debug_path, debug_img)
                 if ok:
                     self.get_logger().info(f'[DEBUG] Path map saved → {debug_path}')
-                else:
-                    self.get_logger().warn(f'[DEBUG] Failed to save path map at {debug_path}')
         except Exception as e:
             self.get_logger().warn(f'[DEBUG] Exception generating path image: {e}')
         # ──────────────────────────────────────────────────────────────────────
