@@ -11,6 +11,7 @@ source /opt/ros/humble/setup.bash
 set-turtlebot 21
 sanity
 ros2 action send_goal /T21/undock irobot_create_msgs/action/Undock {}
+ros2 action send_goal /T21/dock irobot_create_msgs/action/Dock {}
 ```
 
 Check after 20 sec

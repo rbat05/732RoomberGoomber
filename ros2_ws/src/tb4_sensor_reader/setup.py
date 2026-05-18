@@ -33,6 +33,8 @@ setup(
             'camera_detector = tb4_sensor_reader.camera_detector:main',
             'detect_and_stop = tb4_sensor_reader.detect_and_stop:main',
             'proj2_movement=tb4_sensor_reader.proj2_movement:main',
+            'ctest_odom=tb4_sensor_reader.ctest_odom:main',
+            'proj2_script=tb4_sensor_reader.proj2_script:main',
         ],
     },
 )
