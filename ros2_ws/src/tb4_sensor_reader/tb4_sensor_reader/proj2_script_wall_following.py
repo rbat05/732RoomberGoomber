@@ -3,7 +3,7 @@
 Autonomous Cube Finder — COMPSYS732
 Phase 2 autonomous search node.
 
-States: SEARCHING → REPORTING → RETURNING → DONE
+States: WALL_FOLLOWING → CUBE_FINDING → REPORTING → RETURNING → DONE
 
 To run:
     ~/ros2_venv/bin/python3 -m tb4_sensor_reader.autonomous_search
@@ -27,13 +27,13 @@ AVOID_TURN_SPEED = 0.5       # rad/s — obstacle avoidance turns
 RETURN_SPEED     = 0.15      # m/s — return to start
 
 # ── Tolerances ─────────────────────────────────────────────────────────────────
-WAYPOINT_TOLERANCE  = 0.5   # m — close enough to waypoint to advance
+WAYPOINT_TOLERANCE  = 0.5    # m — close enough to waypoint to advance
 HEADING_TOLERANCE   = 0.15   # rad — wide dead-band to prevent oscillation
 RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
 # ── Obstacle avoidance ─────────────────────────────────────────────────────────
-AVOID_DISTANCE      = 0.3   # m — obstacle trigger distance
-AVOID_CLEAR_DIST    = 0.3   # m — must be clear before resuming navigation
+AVOID_DISTANCE      = 0.3    # m — obstacle trigger distance
+AVOID_CLEAR_DIST    = 0.3    # m — must be clear before resuming navigation
 FRONT_ARC_DEG       = 60     # degrees — front detection arc width
 LIDAR_OFFSET_DEG    = -90    # degrees — LiDAR mounting offset
 LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
@@ -56,17 +56,19 @@ CUBE_FORWARD_ARC_DEG = 15    # degrees either side of forward for distance estim
 LIDAR_FALLBACK_DIST  = 0.30  # m — used if forward arc returns no valid ranges
 
 # ── Perimeter following ────────────────────────────────────────────────────────
-# The robot hugs the left wall at this distance while navigating to each feature.
 PERIMETER_WALL_DIST  = 0.35  # m — desired distance from the left wall
 PERIMETER_KP         = 1.2   # proportional gain for wall-following correction
 PERIMETER_SIDE_ARC   = 20    # degrees either side of the 90° left beam
+
+# ── 360° spin (CUBE_FINDING state) ────────────────────────────────────────────
+SPIN_SPEED       = 0.3       # rad/s — rotation speed during cube-finding spin
+SPIN_FULL_CIRCLE = 2 * math.pi  # radians — one complete revolution
 
 # ── Map paths ─────────────────────────────────────────────────────────────────
 PGM_MAP_PATH = os.path.expanduser('~/Desktop/test_map_2.pgm')
 PGM_MAP_YAML = os.path.expanduser('~/Desktop/test_map_2.yaml')
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
-# Used only if PGM feature extraction fails entirely.
 MANUAL_WAYPOINTS = [
     (-2.3, -2.3),
     (1.5, 0.5),
@@ -104,14 +106,13 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
             cx, cy = centroids[i]
             print(f'[EXTRACT]   Component {i}: area={area}  centroid=({cx:.1f},{cy:.1f})')
 
-        # Wall is the largest component — everything else is a candidate
         wall_label = 1 + int(np.argmax(
             [stats[i, cv2.CC_STAT_AREA] for i in range(1, num_labels)]))
         wall_area  = stats[wall_label, cv2.CC_STAT_AREA]
         print(f'[EXTRACT] Wall component: label={wall_label} area={wall_area}')
 
-        MIN_BLOB_AREA = 4    # A 2x2 block is exactly 4 pixels. Reject 1-3 px noise.
-        MAX_BLOB_AREA = 30   # Reject large map artifacts (shoes, tripods, etc)
+        MIN_BLOB_AREA = 4
+        MAX_BLOB_AREA = 30
 
         waypoints = []
         for i in range(1, num_labels):
@@ -126,17 +127,14 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
             print(f'[EXTRACT]   Non-wall component {i}: area={area} dim={blob_w}x{blob_h} '
                   f'centroid=({cx:.1f},{cy:.1f})', end='')
 
-            # 1. Area filtering
             if area < MIN_BLOB_AREA or area > MAX_BLOB_AREA:
                 print(f' → rejected (area {area} out of bounds {MIN_BLOB_AREA}-{MAX_BLOB_AREA})')
                 continue
 
-            # 2. Minimum dimension filtering
             if blob_w < 2 or blob_h < 2:
                 print(f' → rejected (dimensions {blob_w}x{blob_h} too narrow)')
                 continue
 
-            # 3. Aspect ratio filtering
             aspect_ratio = float(blob_w) / float(blob_h)
             if aspect_ratio < 0.5 or aspect_ratio > 2.0:
                 print(f' → rejected (aspect ratio {aspect_ratio:.2f} not circular)')
@@ -147,7 +145,6 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
             waypoints.append((round(world_x, 3), round(world_y, 3)))
             print(f' → accepted  world=({world_x:.3f},{world_y:.3f})')
 
-        # ── Debug image ──────────────────────────────────────────────────────
         try:
             SCALE = 8
             debug_img = cv2.cvtColor(
@@ -200,27 +197,36 @@ class AutonomousSearch(Node):
             self.odom_callback, 10)
 
         # ── Sensor state ─────────────────────────────────────────────────────
-        self.current_x      = 0.0
-        self.current_y      = 0.0
-        self.current_yaw    = 0.0
-        self.nearest_front  = float('inf')
-        self.nearest_left   = float('inf')
-        self.nearest_right  = float('inf')
-        self.nearest_left_side = float('inf')   # pure 90° left beam for wall follow
-        self.latest_scan    = None
-        self.latest_image   = None
-        self.cube_detected  = False
+        self.current_x         = 0.0
+        self.current_y         = 0.0
+        self.current_yaw       = 0.0
+        self.nearest_front     = float('inf')
+        self.nearest_left      = float('inf')
+        self.nearest_right     = float('inf')
+        self.nearest_left_side = float('inf')
+        self.latest_scan       = None
+        self.latest_image      = None
+        self.cube_detected     = False
 
         # ── Waypoints ────────────────────────────────────────────────────────
         self.waypoints      = self._load_waypoints()
         self.waypoint_index = 0
 
-        # ── Obstacle avoidance memory ─────────────────────────────────────────
-        self.avoiding        = False
-        self.avoid_direction = 0         # +1 = left, -1 = right
+        # ── 360° spin bookkeeping ─────────────────────────────────────────────
+        # spin_start_yaw  — yaw when the spin began
+        # spin_accumulated — total absolute rotation so far (always positive)
+        # spin_last_yaw   — yaw at the previous control tick (for delta calc)
+        self.spin_start_yaw   = None
+        self.spin_accumulated = 0.0
+        self.spin_last_yaw    = None
 
         # ── State machine ─────────────────────────────────────────────────────
-        self.state      = 'SEARCHING'
+        #   WALL_FOLLOWING → perimeter-follow toward current waypoint
+        #   CUBE_FINDING   → spin 360° at the waypoint, scanning for the cube
+        #   REPORTING      → log cube location, save snapshot
+        #   RETURNING      → drive back to origin
+        #   DONE           → stop and report results
+        self.state      = 'WALL_FOLLOWING'
         self.start_time = time.time()
 
         # ── Reported results ──────────────────────────────────────────────────
@@ -238,12 +244,6 @@ class AutonomousSearch(Node):
     # ── Waypoint loading ──────────────────────────────────────────────────────
 
     def _load_waypoints(self):
-        """
-        Extract cylinder positions from PGM map and use them directly as
-        waypoints. The robot will perimeter-follow toward each cylinder's
-        world-frame (x, y) position in sequence.
-        Falls back to MANUAL_WAYPOINTS on failure.
-        """
         if PGM_MAP_PATH is None or not os.path.exists(PGM_MAP_PATH):
             self.get_logger().info('No PGM map found — using manual waypoints')
             return list(MANUAL_WAYPOINTS)
@@ -260,7 +260,6 @@ class AutonomousSearch(Node):
         for i, cyl in enumerate(cylinders):
             self.get_logger().info(f'  [{i}] {cyl}')
 
-        # ── Visual debug: mark cylinder targets on the map image ─────────────
         try:
             import yaml
             with open(PGM_MAP_YAML, 'r') as f:
@@ -283,23 +282,17 @@ class AutonomousSearch(Node):
                     return (max(0, min(w - 1, px)) * SCALE,
                             max(0, min(h - 1, py)) * SCALE)
 
-                # Robot origin
                 origin_px = w2p_scaled(0.0, 0.0)
                 cv2.circle(debug_img, origin_px, 6, (255, 0, 0), -1)
-
-                # X-axis arrow (red)
                 cv2.arrowedLine(debug_img, origin_px, w2p_scaled(0.4, 0.0),
                                 (0, 0, 255), 3, tipLength=0.2)
-                # Y-axis arrow (green)
                 cv2.arrowedLine(debug_img, origin_px, w2p_scaled(0.0, 0.4),
                                 (0, 255, 0), 3, tipLength=0.2)
 
-                # Draw cylinders and straight-line path between them
                 sequence = [(0.0, 0.0)] + cylinders
                 for i in range(len(sequence) - 1):
                     pt1 = w2p_scaled(*sequence[i])
                     pt2 = w2p_scaled(*sequence[i + 1])
-                    # Dashed straight line showing intended travel direction
                     cv2.arrowedLine(debug_img, pt1, pt2, (0, 200, 255), 2,
                                     tipLength=0.04)
 
@@ -341,8 +334,6 @@ class AutonomousSearch(Node):
         self.nearest_left  = arc_min(front_i,          front_i + side_a)
         self.nearest_right = arc_min(front_i - side_a, front_i)
 
-        # ── Pure left-side beam for wall following ───────────────────────────
-        # 90° to the left of forward + small arc
         left_i  = front_i + int(round(math.radians(90) / inc))
         left_hw = int(round(math.radians(PERIMETER_SIDE_ARC) / inc))
         self.nearest_left_side = arc_min(left_i - left_hw, left_i + left_hw)
@@ -359,7 +350,9 @@ class AutonomousSearch(Node):
     def image_callback(self, msg):
         img = self.bridge.compressed_imgmsg_to_cv2(msg, 'bgr8')
         self.latest_image = img
-        if self.state != 'SEARCHING':
+        # Detection is evaluated only inside CUBE_FINDING, but we let the
+        # flag be set here so the control loop sees it immediately.
+        if self.state != 'CUBE_FINDING':
             return
         hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         mask = cv2.bitwise_or(
@@ -421,35 +414,16 @@ class AutonomousSearch(Node):
     # ── Perimeter following ───────────────────────────────────────────────────
 
     def _perimeter_steer(self, target_x, target_y):
-        """
-        Blend wall-following (left side) with heading toward the target waypoint.
-
-        Strategy:
-          1. If front is blocked → turn right (away from wall).
-          2. Otherwise drive forward and apply a proportional correction
-             to keep the left wall at PERIMETER_WALL_DIST.
-             A positive error (too far from wall) adds left turn;
-             a negative error (too close) adds right turn.
-
-        Returns (linear, angular) command values.
-        """
-        # ── Front obstacle: committed right turn ─────────────────────────────
         if self.nearest_front <= AVOID_DISTANCE:
-            return 0.0, -AVOID_TURN_SPEED   # turn right to follow wall
+            return 0.0, -AVOID_TURN_SPEED
 
-        # ── Wall-following correction ─────────────────────────────────────────
-        # wall_err > 0  → too far from wall → steer left  (positive angular)
-        # wall_err < 0  → too close to wall → steer right (negative angular)
-        wall_err = PERIMETER_WALL_DIST - self.nearest_left_side
+        wall_err       = PERIMETER_WALL_DIST - self.nearest_left_side
         wall_correction = PERIMETER_KP * wall_err
 
-        # ── Soft heading bias toward the target ──────────────────────────────
-        # Keeps the robot progressing around the arena even in open sections.
         target_angle = math.atan2(
             target_y - self.current_y,
             target_x - self.current_x)
-        heading_err = self._angle_diff(target_angle, self.current_yaw)
-        # Gentle weight (0.3) so heading doesn't override wall following
+        heading_err  = self._angle_diff(target_angle, self.current_yaw)
         heading_bias = 0.3 * heading_err
 
         angular = float(np.clip(wall_correction + heading_bias,
@@ -462,26 +436,43 @@ class AutonomousSearch(Node):
 
         return FORWARD_SPEED, angular
 
+    # ── 360° spin helpers ─────────────────────────────────────────────────────
+
+    def _start_spin(self):
+        """Initialise bookkeeping for a fresh 360° rotation."""
+        self.spin_start_yaw   = self.current_yaw
+        self.spin_last_yaw    = self.current_yaw
+        self.spin_accumulated = 0.0
+        self.cube_detected    = False   # clear stale detections from travel
+        self.get_logger().info(
+            f'[SPIN] Starting 360° scan at '
+            f'({self.current_x:.2f}, {self.current_y:.2f})  '
+            f'yaw₀={math.degrees(self.current_yaw):.1f}°')
+
+    def _update_spin(self):
+        """
+        Accumulate rotation and return True once a full circle is complete.
+        Uses incremental deltas to handle the ±π wrap-around cleanly.
+        """
+        delta = abs(self._angle_diff(self.current_yaw, self.spin_last_yaw))
+        self.spin_accumulated += delta
+        self.spin_last_yaw     = self.current_yaw
+        return self.spin_accumulated >= SPIN_FULL_CIRCLE
+
     # ── State machine ─────────────────────────────────────────────────────────
 
     def control_loop(self):
 
-        # ── Time limit ───────────────────────────────────────────────────────
-        if self.state == 'SEARCHING':
+        # ── Global time limit (only while still searching) ───────────────────
+        if self.state in ('WALL_FOLLOWING', 'CUBE_FINDING'):
             if time.time() - self.start_time >= TIME_LIMIT_S:
                 self.get_logger().warn('Time limit reached — transitioning to RETURNING')
                 self.stop()
                 self.state = 'RETURNING'
                 return
 
-        # ── SEARCHING ────────────────────────────────────────────────────────
-        if self.state == 'SEARCHING':
-
-            if self.cube_detected:
-                self.stop()
-                self.get_logger().info('Red cube detected — transitioning to REPORTING')
-                self.state = 'REPORTING'
-                return
+        # ── WALL_FOLLOWING ───────────────────────────────────────────────────
+        if self.state == 'WALL_FOLLOWING':
 
             if self.waypoint_index >= len(self.waypoints):
                 self.get_logger().warn(
@@ -494,21 +485,53 @@ class AutonomousSearch(Node):
             dist = self._distance_to(target_x, target_y)
 
             if dist < WAYPOINT_TOLERANCE:
+                # Waypoint reached — switch to 360° scan
                 self.stop()
                 self.get_logger().info(
                     f'Waypoint {self.waypoint_index} reached '
-                    f'({target_x:.2f}, {target_y:.2f})')
-                self.waypoint_index += 1
+                    f'({target_x:.2f}, {target_y:.2f}) — starting cube scan')
+                self._start_spin()
+                self.state = 'CUBE_FINDING'
                 return
 
-            # ── Perimeter following toward current target ────────────────────
             linear, angular = self._perimeter_steer(target_x, target_y)
             self._publish_twist(linear, angular)
 
             self.get_logger().info(
-                f'→ WP{self.waypoint_index} ({target_x:.2f},{target_y:.2f}) '
+                f'[WALL_FOLLOWING] → WP{self.waypoint_index} '
+                f'({target_x:.2f},{target_y:.2f}) '
                 f'dist={dist:.2f} m  '
                 f'pos=({self.current_x:.2f},{self.current_y:.2f})')
+
+        # ── CUBE_FINDING ─────────────────────────────────────────────────────
+        elif self.state == 'CUBE_FINDING':
+
+            # Cube spotted mid-spin → stop and report
+            if self.cube_detected:
+                self.stop()
+                self.get_logger().info(
+                    f'[CUBE_FINDING] Red cube detected at WP{self.waypoint_index} '
+                    f'— transitioning to REPORTING')
+                self.state = 'REPORTING'
+                return
+
+            # Spin the robot counter-clockwise
+            self._publish_twist(0.0, SPIN_SPEED)
+
+            spin_done = self._update_spin()
+            self.get_logger().info(
+                f'[CUBE_FINDING] WP{self.waypoint_index}  '
+                f'rotated={math.degrees(self.spin_accumulated):.1f}°  '
+                f'yaw={math.degrees(self.current_yaw):.1f}°')
+
+            if spin_done:
+                # Full rotation complete, no cube → move to next waypoint
+                self.stop()
+                self.get_logger().info(
+                    f'[CUBE_FINDING] 360° complete at WP{self.waypoint_index} — '
+                    f'no cube found, advancing to next waypoint')
+                self.waypoint_index += 1
+                self.state = 'WALL_FOLLOWING'
 
         # ── REPORTING ────────────────────────────────────────────────────────
         elif self.state == 'REPORTING':
