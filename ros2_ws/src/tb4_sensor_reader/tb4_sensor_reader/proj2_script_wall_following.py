@@ -10,7 +10,6 @@ To run:
 """
 
 import rclpy, cv2, math, os, time
-import heapq
 import numpy as np
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -19,7 +18,7 @@ from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 
 # ── Robot namespace ────────────────────────────────────────────────────────────
-NAMESPACE = '/20'
+NAMESPACE = '/T6'
 
 # ── Motion parameters ──────────────────────────────────────────────────────────
 FORWARD_SPEED    = 0.15      # m/s — waypoint navigation
@@ -28,14 +27,14 @@ AVOID_TURN_SPEED = 0.5       # rad/s — obstacle avoidance turns
 RETURN_SPEED     = 0.15      # m/s — return to start
 
 # ── Tolerances ─────────────────────────────────────────────────────────────────
-WAYPOINT_TOLERANCE  = 0.15   # m — close enough to waypoint to advance
+WAYPOINT_TOLERANCE  = 0.5   # m — close enough to waypoint to advance
 HEADING_TOLERANCE   = 0.15   # rad — wide dead-band to prevent oscillation
 RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
 # ── Obstacle avoidance ─────────────────────────────────────────────────────────
-AVOID_DISTANCE      = 0.30   # m — obstacle trigger distance
-AVOID_CLEAR_DIST    = 0.30   # m — must be clear before resuming navigation
-FRONT_ARC_DEG       = 1     # degrees — front detection arc width
+AVOID_DISTANCE      = 0.3   # m — obstacle trigger distance
+AVOID_CLEAR_DIST    = 0.3   # m — must be clear before resuming navigation
+FRONT_ARC_DEG       = 60     # degrees — front detection arc width
 LIDAR_OFFSET_DEG    = -90    # degrees — LiDAR mounting offset
 LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
 
@@ -56,198 +55,24 @@ SNAPSHOT_PATH = os.path.expanduser('~/Desktop/detection_snapshot.jpg')
 CUBE_FORWARD_ARC_DEG = 15    # degrees either side of forward for distance estimate
 LIDAR_FALLBACK_DIST  = 0.30  # m — used if forward arc returns no valid ranges
 
-# ── Path planning ──────────────────────────────────────────────────────────────
-ROBOT_RADIUS_M  = 0.20       # m — inflation radius around obstacles
-LOS_TOLERANCE   = 5          # px — min pixel distance between simplified waypoints
+# ── Perimeter following ────────────────────────────────────────────────────────
+# The robot hugs the left wall at this distance while navigating to each feature.
+PERIMETER_WALL_DIST  = 0.35  # m — desired distance from the left wall
+PERIMETER_KP         = 1.2   # proportional gain for wall-following correction
+PERIMETER_SIDE_ARC   = 20    # degrees either side of the 90° left beam
 
 # ── Map paths ─────────────────────────────────────────────────────────────────
-PGM_MAP_PATH = os.path.expanduser('~/Desktop/test_map.pgm')
-PGM_MAP_YAML = os.path.expanduser('~/Desktop/test_map.yaml')
+PGM_MAP_PATH = os.path.expanduser('~/Desktop/test_map_2.pgm')
+PGM_MAP_YAML = os.path.expanduser('~/Desktop/test_map_2.yaml')
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
-# Used only if PGM feature extraction or A* planning fails entirely.
+# Used only if PGM feature extraction fails entirely.
 MANUAL_WAYPOINTS = [
     (-2.3, -2.3),
     (1.5, 0.5),
     (1.5, 1.0),
 ]
 
-
-# ── A* path planner ────────────────────────────────────────────────────────────
-
-def astar(grid, start, goal):
-    """
-    A* search on a 2D occupancy grid.
-    grid  : 2D numpy array — 0 = free, 255 = occupied
-    start : (col, row) pixel tuple
-    goal  : (col, row) pixel tuple
-    Returns list of (col, row) pixels start→goal, or None if no path found.
-    """
-    rows, cols = grid.shape
-    sc, sr = start
-    gc, gr = goal
-
-    if grid[sr, sc] != 0 or grid[gr, gc] != 0:
-        return None
-
-    def h(c, r):
-        return math.sqrt((c - gc) ** 2 + (r - gr) ** 2)
-
-    # heap entries: (f, g, col, row, path)
-    open_heap = []
-    heapq.heappush(open_heap, (h(sc, sr), 0.0, sc, sr, []))
-    visited = set()
-
-    # 8-connected neighbours
-    neighbours = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
-
-    while open_heap:
-        f, g, c, r, path = heapq.heappop(open_heap)
-        if (c, r) in visited:
-            continue
-        visited.add((c, r))
-        path = path + [(c, r)]
-
-        if c == gc and r == gr:
-            return path
-
-        for dc, dr in neighbours:
-            nc, nr = c + dc, r + dr
-            if 0 <= nc < cols and 0 <= nr < rows:
-                if (nc, nr) not in visited and grid[nr, nc] == 0:
-                    ng = g + math.sqrt(dc ** 2 + dr ** 2)
-                    heapq.heappush(open_heap, (ng + h(nc, nr), ng, nc, nr, path))
-
-    return None
-
-
-def simplify_path(pixel_path, grid, tolerance=5):
-    """
-    Reduce waypoints using line-of-sight simplification (Bresenham).
-    Skips intermediate points where direct LOS is unobstructed.
-    tolerance: minimum pixel distance between kept waypoints.
-    """
-    if len(pixel_path) <= 2:
-        return pixel_path
-
-    def los_clear(p1, p2):
-        c1, r1 = p1
-        c2, r2 = p2
-        dc = abs(c2 - c1); dr = abs(r2 - r1)
-        sc = 1 if c1 < c2 else -1
-        sr = 1 if r1 < r2 else -1
-        err = dc - dr
-        c, r = c1, r1
-        while True:
-            if grid[r, c] != 0:
-                return False
-            if c == c2 and r == r2:
-                return True
-            e2 = 2 * err
-            if e2 > -dr: err -= dr; c += sc
-            if e2 <  dc: err += dc; r += sr
-
-    simplified = [pixel_path[0]]
-    i = 0
-    while i < len(pixel_path) - 1:
-        j = len(pixel_path) - 1
-        while j > i + 1:
-            p1, p2 = pixel_path[i], pixel_path[j]
-            dist = math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
-            if dist >= tolerance and los_clear(p1, p2):
-                break
-            j -= 1
-        simplified.append(pixel_path[j])
-        i = j
-    return simplified
-
-
-def plan_path_on_map(pgm_path, yaml_path, start_world, goal_world):
-    try:
-        import yaml
-        with open(yaml_path, 'r') as f:
-            meta = yaml.safe_load(f)
-        resolution = meta['resolution']
-        origin     = meta['origin']
-
-        img = cv2.imread(pgm_path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            return None
-        h, w = img.shape
-
-        _, occupied = cv2.threshold(img, 50, 255, cv2.THRESH_BINARY_INV)
-
-        radius_px = max(1, int(math.ceil(ROBOT_RADIUS_M / resolution)))
-        kernel    = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * radius_px + 1, 2 * radius_px + 1))
-        inflated  = cv2.dilate(occupied, kernel)
-
-        def w2p(wx, wy):
-            px = int((wx - origin[0]) / resolution)
-            py = int(h - (wy - origin[1]) / resolution)
-            return max(0, min(w - 1, px)), max(0, min(h - 1, py))
-
-        def p2w(px, py):
-            return (
-                round(origin[0] + px * resolution, 3),
-                round(origin[1] + (h - py) * resolution, 3))
-
-        start_px = w2p(*start_world)
-        goal_px  = w2p(*goal_world)
-
-        # FORCE CLEAR a large starting zone (radius_px * 2) so A* can escape the tape mark
-        cv2.circle(inflated, start_px, radius_px * 2, 0, -1)
-        
-        # Clear the goal zone normally
-        cv2.circle(inflated, goal_px, radius_px + 2, 0, -1)
-        print(f'[ASTAR] start_px={start_px} goal_px={goal_px}  '
-              f'start_free={inflated[start_px[1], start_px[0]]==0}  '
-              f'goal_free={inflated[goal_px[1], goal_px[0]]==0}')
-
-        # ── Nudge goal if it lands inside an inflated obstacle ───────────────
-        # Search outward in a spiral until a free cell is found
-        if inflated[goal_px[1], goal_px[0]] != 0:
-            print(f'[ASTAR] Goal pixel is occupied — searching for nearest free cell')
-            found = False
-            for radius in range(1, radius_px * 3):
-                for dc in range(-radius, radius + 1):
-                    for dr in range(-radius, radius + 1):
-                        if abs(dc) != radius and abs(dr) != radius:
-                            continue
-                        nc = max(0, min(w - 1, goal_px[0] + dc))
-                        nr = max(0, min(h - 1, goal_px[1] + dr))
-                        if inflated[nr, nc] == 0:
-                            print(f'[ASTAR] Nudged goal from {goal_px} → ({nc},{nr})')
-                            goal_px = (nc, nr)
-                            found = True
-                            break
-                    if found:
-                        break
-                if found:
-                    break
-            if not found:
-                print('[ASTAR] Could not find free cell near goal — aborting')
-                return None
-
-        # ── Check start is free ──────────────────────────────────────────────
-        if inflated[start_px[1], start_px[0]] != 0:
-            print(f'[ASTAR] Start pixel is occupied — cannot plan')
-            return None
-
-        pixel_path = astar(inflated, start_px, goal_px)
-        if pixel_path is None:
-            print(f'[ASTAR] No path found between {start_px} and {goal_px}')
-            return None
-
-        print(f'[ASTAR] Raw path: {len(pixel_path)} px  → simplifying')
-        simplified = simplify_path(pixel_path, inflated, tolerance=LOS_TOLERANCE)
-        print(f'[ASTAR] Simplified path: {len(simplified)} waypoints')
-
-        return [p2w(px, py) for px, py in simplified[1:]]
-
-    except Exception as e:
-        print(f'[ASTAR] Unexpected exception: {e}')
-        return None
 
 # ── Cylinder feature extraction ────────────────────────────────────────────────
 
@@ -285,13 +110,6 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
         wall_area  = stats[wall_label, cv2.CC_STAT_AREA]
         print(f'[EXTRACT] Wall component: label={wall_label} area={wall_area}')
 
-        # Accept small isolated components — these are the cylinder blobs
-        # At 0.05 m/px a 12 cm cylinder = ~2.4 px diameter → area roughly 2–20 px
-        MIN_BLOB_AREA = 2
-        MAX_BLOB_AREA = 30
-
-        # Accept small isolated components — these are the cylinder blobs
-        # At 0.05 m/px a 12 cm cylinder = ~2.4 px diameter 
         MIN_BLOB_AREA = 4    # A 2x2 block is exactly 4 pixels. Reject 1-3 px noise.
         MAX_BLOB_AREA = 30   # Reject large map artifacts (shoes, tripods, etc)
 
@@ -299,33 +117,31 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
         for i in range(1, num_labels):
             if i == wall_label:
                 continue
-                
+
             area   = stats[i, cv2.CC_STAT_AREA]
             blob_w = stats[i, cv2.CC_STAT_WIDTH]
             blob_h = stats[i, cv2.CC_STAT_HEIGHT]
             cx, cy = centroids[i]
-            
+
             print(f'[EXTRACT]   Non-wall component {i}: area={area} dim={blob_w}x{blob_h} '
                   f'centroid=({cx:.1f},{cy:.1f})', end='')
-                  
-            # 1. Area filtering (Stricter minimum)
+
+            # 1. Area filtering
             if area < MIN_BLOB_AREA or area > MAX_BLOB_AREA:
                 print(f' → rejected (area {area} out of bounds {MIN_BLOB_AREA}-{MAX_BLOB_AREA})')
                 continue
-                
-            # 2. Minimum Dimension filtering (Reject 1-pixel thin lines of noise)
+
+            # 2. Minimum dimension filtering
             if blob_w < 2 or blob_h < 2:
                 print(f' → rejected (dimensions {blob_w}x{blob_h} too narrow)')
                 continue
-                
-            # 3. Aspect Ratio filtering (Must be roughly circular/square)
-            # A perfect cylinder blob should have an aspect ratio near 1.0
+
+            # 3. Aspect ratio filtering
             aspect_ratio = float(blob_w) / float(blob_h)
             if aspect_ratio < 0.5 or aspect_ratio > 2.0:
                 print(f' → rejected (aspect ratio {aspect_ratio:.2f} not circular)')
                 continue
 
-            # If it passes all strict shape and area tests, record the coordinate
             world_x = origin[0] + cx * resolution
             world_y = origin[1] + (h - cy) * resolution
             waypoints.append((round(world_x, 3), round(world_y, 3)))
@@ -358,6 +174,7 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
         print(f'[EXTRACT] Unexpected exception: {e}')
         return None
 
+
 # ── Main node ──────────────────────────────────────────────────────────────────
 
 class AutonomousSearch(Node):
@@ -389,6 +206,7 @@ class AutonomousSearch(Node):
         self.nearest_front  = float('inf')
         self.nearest_left   = float('inf')
         self.nearest_right  = float('inf')
+        self.nearest_left_side = float('inf')   # pure 90° left beam for wall follow
         self.latest_scan    = None
         self.latest_image   = None
         self.cube_detected  = False
@@ -419,15 +237,12 @@ class AutonomousSearch(Node):
 
     # ── Waypoint loading ──────────────────────────────────────────────────────
 
-# ── Waypoint loading ──────────────────────────────────────────────────────
-
-    # ── Waypoint loading ──────────────────────────────────────────────────────
-
     def _load_waypoints(self):
         """
-        Extract cylinder positions from PGM map, plan an A* path from (0,0)
-        through each cylinder in order, and return the full concatenated
-        world-frame waypoint list. Falls back to MANUAL_WAYPOINTS on failure.
+        Extract cylinder positions from PGM map and use them directly as
+        waypoints. The robot will perimeter-follow toward each cylinder's
+        world-frame (x, y) position in sequence.
+        Falls back to MANUAL_WAYPOINTS on failure.
         """
         if PGM_MAP_PATH is None or not os.path.exists(PGM_MAP_PATH):
             self.get_logger().info('No PGM map found — using manual waypoints')
@@ -441,33 +256,11 @@ class AutonomousSearch(Node):
             return list(MANUAL_WAYPOINTS)
 
         self.get_logger().info(
-            f'Found {len(cylinders)} cylinders: {cylinders}')
-
-        full_path     = []
-        current_start = (0.0, 0.0)
-
+            f'Found {len(cylinders)} cylinders — using as direct waypoints:')
         for i, cyl in enumerate(cylinders):
-            self.get_logger().info(f'Planning A* path to cylinder {i}: {cyl}')
-            segment = plan_path_on_map(
-                PGM_MAP_PATH, PGM_MAP_YAML, current_start, cyl)
+            self.get_logger().info(f'  [{i}] {cyl}')
 
-            if segment:
-                self.get_logger().info(
-                    f'  Path found — {len(segment)} waypoints')
-                full_path.extend(segment)
-            else:
-                self.get_logger().warn(
-                    f'  A* failed for cylinder {i} — inserting direct waypoint')
-                full_path.append(cyl)
-
-            current_start = cyl
-
-        if not full_path:
-            self.get_logger().warn(
-                'Path planning produced no waypoints — using manual')
-            return list(MANUAL_WAYPOINTS)
-
-        # ── VISUAL PATH DEBUGGING ─────────────────────────────────────────────
+        # ── Visual debug: mark cylinder targets on the map image ─────────────
         try:
             import yaml
             with open(PGM_MAP_YAML, 'r') as f:
@@ -478,67 +271,53 @@ class AutonomousSearch(Node):
             img = cv2.imread(PGM_MAP_PATH, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 h, w = img.shape
-                SCALE = 6  # Scale the image up 6x so it's easily readable
+                SCALE = 6
                 debug_img = cv2.cvtColor(
-                    cv2.resize(img, (w * SCALE, h * SCALE), interpolation=cv2.INTER_NEAREST),
+                    cv2.resize(img, (w * SCALE, h * SCALE),
+                               interpolation=cv2.INTER_NEAREST),
                     cv2.COLOR_GRAY2BGR)
 
-                # Helper to convert world (x,y) to scaled pixel (px, py)
                 def w2p_scaled(wx, wy):
                     px = int((wx - origin[0]) / resolution)
                     py = int(h - (wy - origin[1]) / resolution)
-                    return (max(0, min(w - 1, px)) * SCALE, max(0, min(h - 1, py)) * SCALE)
+                    return (max(0, min(w - 1, px)) * SCALE,
+                            max(0, min(h - 1, py)) * SCALE)
 
-                # 1. Draw target cylinders in RED
-                for cyl in cylinders:
-                    cv2.circle(debug_img, w2p_scaled(*cyl), 10, (0, 0, 255), -1)
-
-                # 2. Draw Robot Origin (0,0) and Local Coordinate Frame
+                # Robot origin
                 origin_px = w2p_scaled(0.0, 0.0)
-                
-                # Robot X-axis (Forward) -> +0.4m in X. Drawn in RED (BGR: 0, 0, 255)
-                x_axis_px = w2p_scaled(0.4, 0.0)
-                cv2.arrowedLine(debug_img, origin_px, x_axis_px, (0, 0, 255), 3, tipLength=0.2)
-                cv2.putText(debug_img, 'X', (x_axis_px[0] + 5, x_axis_px[1]), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                
-                # Robot Y-axis (Left) -> +0.4m in Y. Drawn in GREEN (BGR: 0, 255, 0)
-                y_axis_px = w2p_scaled(0.0, 0.4)
-                cv2.arrowedLine(debug_img, origin_px, y_axis_px, (0, 255, 0), 3, tipLength=0.2)
-                cv2.putText(debug_img, 'Y', (y_axis_px[0] - 5, y_axis_px[1] - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # Origin dot in BLUE
                 cv2.circle(debug_img, origin_px, 6, (255, 0, 0), -1)
 
-                # 3. Draw arrows along the full generated path in a distinct color (e.g. CYAN)
-                # (Changed from green so it doesn't blend with the Y-axis)
-                path_sequence = [(0.0, 0.0)] + full_path
-                for i in range(len(path_sequence) - 1):
-                    pt1 = w2p_scaled(*path_sequence[i])
-                    pt2 = w2p_scaled(*path_sequence[i+1])
-                    
-                    # Draw arrow line connecting the waypoints
-                    cv2.arrowedLine(debug_img, pt1, pt2, (255, 255, 0), 2, tipLength=0.03)
-                    
-                    # Draw a small blue dot at each intermediate waypoint
-                    cv2.circle(debug_img, pt2, 4, (255, 0, 0), -1)
+                # X-axis arrow (red)
+                cv2.arrowedLine(debug_img, origin_px, w2p_scaled(0.4, 0.0),
+                                (0, 0, 255), 3, tipLength=0.2)
+                # Y-axis arrow (green)
+                cv2.arrowedLine(debug_img, origin_px, w2p_scaled(0.0, 0.4),
+                                (0, 255, 0), 3, tipLength=0.2)
 
-                # Save to disk
+                # Draw cylinders and straight-line path between them
+                sequence = [(0.0, 0.0)] + cylinders
+                for i in range(len(sequence) - 1):
+                    pt1 = w2p_scaled(*sequence[i])
+                    pt2 = w2p_scaled(*sequence[i + 1])
+                    # Dashed straight line showing intended travel direction
+                    cv2.arrowedLine(debug_img, pt1, pt2, (0, 200, 255), 2,
+                                    tipLength=0.04)
+
+                for i, (wx, wy) in enumerate(cylinders):
+                    px = w2p_scaled(wx, wy)
+                    cv2.circle(debug_img, px, 10, (0, 0, 255), -1)
+                    cv2.putText(debug_img, f'{i}:({wx:.2f},{wy:.2f})',
+                                (px[0] + 8, px[1] - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
                 debug_path = os.path.expanduser('~/Desktop/path_debug.jpg')
                 ok = cv2.imwrite(debug_path, debug_img)
-                if ok:
-                    self.get_logger().info(f'[DEBUG] Path map saved → {debug_path}')
-                else:
-                    self.get_logger().warn(f'[DEBUG] Failed to save path map at {debug_path}')
+                self.get_logger().info(
+                    f'[DEBUG] Waypoint map saved → {debug_path} (ok={ok})')
         except Exception as e:
-            self.get_logger().warn(f'[DEBUG] Exception generating path image: {e}')
-        # ──────────────────────────────────────────────────────────────────────
+            self.get_logger().warn(f'[DEBUG] Exception generating debug image: {e}')
 
-        self.get_logger().info(
-            f'Total planned path: {len(full_path)} waypoints')
-        return full_path
-    
+        return list(cylinders)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -561,6 +340,12 @@ class AutonomousSearch(Node):
         self.nearest_front = arc_min(front_i - half_a, front_i + half_a)
         self.nearest_left  = arc_min(front_i,          front_i + side_a)
         self.nearest_right = arc_min(front_i - side_a, front_i)
+
+        # ── Pure left-side beam for wall following ───────────────────────────
+        # 90° to the left of forward + small arc
+        left_i  = front_i + int(round(math.radians(90) / inc))
+        left_hw = int(round(math.radians(PERIMETER_SIDE_ARC) / inc))
+        self.nearest_left_side = arc_min(left_i - left_hw, left_i + left_hw)
 
     def odom_callback(self, msg):
         pos = msg.pose.pose.position
@@ -633,6 +418,50 @@ class AutonomousSearch(Node):
         else:
             self.get_logger().warn('cv2.imwrite FAILED — snapshot not saved')
 
+    # ── Perimeter following ───────────────────────────────────────────────────
+
+    def _perimeter_steer(self, target_x, target_y):
+        """
+        Blend wall-following (left side) with heading toward the target waypoint.
+
+        Strategy:
+          1. If front is blocked → turn right (away from wall).
+          2. Otherwise drive forward and apply a proportional correction
+             to keep the left wall at PERIMETER_WALL_DIST.
+             A positive error (too far from wall) adds left turn;
+             a negative error (too close) adds right turn.
+
+        Returns (linear, angular) command values.
+        """
+        # ── Front obstacle: committed right turn ─────────────────────────────
+        if self.nearest_front <= AVOID_DISTANCE:
+            return 0.0, -AVOID_TURN_SPEED   # turn right to follow wall
+
+        # ── Wall-following correction ─────────────────────────────────────────
+        # wall_err > 0  → too far from wall → steer left  (positive angular)
+        # wall_err < 0  → too close to wall → steer right (negative angular)
+        wall_err = PERIMETER_WALL_DIST - self.nearest_left_side
+        wall_correction = PERIMETER_KP * wall_err
+
+        # ── Soft heading bias toward the target ──────────────────────────────
+        # Keeps the robot progressing around the arena even in open sections.
+        target_angle = math.atan2(
+            target_y - self.current_y,
+            target_x - self.current_x)
+        heading_err = self._angle_diff(target_angle, self.current_yaw)
+        # Gentle weight (0.3) so heading doesn't override wall following
+        heading_bias = 0.3 * heading_err
+
+        angular = float(np.clip(wall_correction + heading_bias,
+                                -AVOID_TURN_SPEED, AVOID_TURN_SPEED))
+
+        self.get_logger().info(
+            f'[PERIM] left_wall={self.nearest_left_side:.2f} m  '
+            f'wall_err={wall_err:+.2f}  hdg_bias={math.degrees(heading_err):+.1f}°  '
+            f'ω={angular:+.2f}')
+
+        return FORWARD_SPEED, angular
+
     # ── State machine ─────────────────────────────────────────────────────────
 
     def control_loop(self):
@@ -640,8 +469,7 @@ class AutonomousSearch(Node):
         # ── Time limit ───────────────────────────────────────────────────────
         if self.state == 'SEARCHING':
             if time.time() - self.start_time >= TIME_LIMIT_S:
-                self.get_logger().warn(
-                    f'Time limit reached — transitioning to RETURNING')
+                self.get_logger().warn('Time limit reached — transitioning to RETURNING')
                 self.stop()
                 self.state = 'RETURNING'
                 return
@@ -673,54 +501,27 @@ class AutonomousSearch(Node):
                 self.waypoint_index += 1
                 return
 
-            # ── Obstacle avoidance ───────────────────────────────────────────
-            if self.nearest_front <= AVOID_DISTANCE and not self.avoiding:
-                self.avoiding = True
-                if self.nearest_left >= self.nearest_right:
-                    self.avoid_direction = +1
-                    self.get_logger().warn('Obstacle — COMMIT LEFT')
-                else:
-                    self.avoid_direction = -1
-                    self.get_logger().warn('Obstacle — COMMIT RIGHT')
-
-            if self.avoiding:
-                if self.nearest_front > AVOID_CLEAR_DIST:
-                    self.avoiding = False
-                    self.get_logger().info('Obstacle cleared')
-                else:
-                    self._publish_twist(0.0, self.avoid_direction * AVOID_TURN_SPEED)
-                    return
-
-            # ── Steer toward waypoint ────────────────────────────────────────
-            target_angle = math.atan2(
-                target_y - self.current_y,
-                target_x - self.current_x)
-            heading_err = self._angle_diff(target_angle, self.current_yaw)
-
-            if abs(heading_err) > HEADING_TOLERANCE:
-                scale = min(1.0, abs(heading_err) / math.pi)
-                turn  = math.copysign(TURN_SPEED * scale, heading_err)
-                self._publish_twist(0.0, turn)
-            else:
-                self._publish_twist(FORWARD_SPEED, 0.0)
+            # ── Perimeter following toward current target ────────────────────
+            linear, angular = self._perimeter_steer(target_x, target_y)
+            self._publish_twist(linear, angular)
 
             self.get_logger().info(
                 f'→ WP{self.waypoint_index} ({target_x:.2f},{target_y:.2f}) '
-                f'dist={dist:.2f} m  hdg_err={math.degrees(heading_err):.1f}°  '
+                f'dist={dist:.2f} m  '
                 f'pos=({self.current_x:.2f},{self.current_y:.2f})')
 
         # ── REPORTING ────────────────────────────────────────────────────────
         elif self.state == 'REPORTING':
             self.stop()
-            
-            # COMPLIANCE FIX: Log exact robot odometry as the cube location
+
             self.cube_x = self.current_x
             self.cube_y = self.current_y
-            
+
             self.get_logger().info(
-                f'Cube position logged at odometry: x={self.cube_x:.3f} m  y={self.cube_y:.3f} m  '
+                f'Cube position logged at odometry: x={self.cube_x:.3f} m  '
+                f'y={self.cube_y:.3f} m  '
                 f'(yaw={math.degrees(self.current_yaw):.1f}°)')
-                
+
             self._save_snapshot()
             self.state = 'RETURNING'
 

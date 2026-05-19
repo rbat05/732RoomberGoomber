@@ -43,6 +43,11 @@ Place robot on tape mark facing correct orientation.
 
 ---
 
+## Reset odom
+```bash
+ros2 service call /T21/reset_pose irobot_create_msgs/srv/ResetPose {}
+```
+
 ## 4. Launch SLAM
 
 Terminal 1:
