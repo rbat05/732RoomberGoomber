@@ -18,7 +18,7 @@ from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 
 # ── Robot namespace ────────────────────────────────────────────────────────────
-NAMESPACE = '/T6'
+NAMESPACE = '/T24'
 
 # ── Motion parameters ──────────────────────────────────────────────────────────
 FORWARD_SPEED    = 0.15      # m/s — waypoint navigation
@@ -32,8 +32,8 @@ HEADING_TOLERANCE   = 0.15   # rad — wide dead-band to prevent oscillation
 RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
 # ── Obstacle avoidance ─────────────────────────────────────────────────────────
-AVOID_DISTANCE      = 0.3    # m — obstacle trigger distance
-AVOID_CLEAR_DIST    = 0.3    # m — must be clear before resuming navigation
+AVOID_DISTANCE      = 0.35    # m — obstacle trigger distance
+AVOID_CLEAR_DIST    = 0.35    # m — must be clear before resuming navigation
 FRONT_ARC_DEG       = 60     # degrees — front detection arc width
 LIDAR_OFFSET_DEG    = -90    # degrees — LiDAR mounting offset
 LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
@@ -46,7 +46,7 @@ RED_LOW1   = np.array([0,   120, 70])
 RED_HIGH1  = np.array([10,  255, 255])
 RED_LOW2   = np.array([170, 120, 70])
 RED_HIGH2  = np.array([180, 255, 255])
-MIN_PIXELS = 25000
+MIN_PIXELS = 20000
 
 # ── Snapshot output path ───────────────────────────────────────────────────────
 SNAPSHOT_PATH = os.path.expanduser('~/Desktop/detection_snapshot.jpg')
@@ -550,9 +550,7 @@ class AutonomousSearch(Node):
 
         # ── RETURNING ────────────────────────────────────────────────────────
         elif self.state == 'RETURNING':
-            dx   = 0.0 - self.current_x
-            dy   = 0.0 - self.current_y
-            dist = math.sqrt(dx ** 2 + dy ** 2)
+            dist = self._distance_to(0.0, 0.0)
 
             if dist < RETURN_TOLERANCE:
                 self.stop()
@@ -563,19 +561,12 @@ class AutonomousSearch(Node):
                 self.state = 'DONE'
                 return
 
-            target_angle = math.atan2(dy, dx)
-            heading_err  = self._angle_diff(target_angle, self.current_yaw)
-
-            if abs(heading_err) > HEADING_TOLERANCE:
-                scale = min(1.0, abs(heading_err) / math.pi)
-                turn  = math.copysign(TURN_SPEED * scale, heading_err)
-                self._publish_twist(0.0, turn)
-            else:
-                self._publish_twist(RETURN_SPEED, 0.0)
+            linear, angular = self._perimeter_steer(0.0, 0.0)
+            self._publish_twist(linear, angular)
 
             self.get_logger().info(
-                f'Returning | dist={dist:.2f} m  '
-                f'hdg_err={math.degrees(heading_err):.1f}°')
+                f'[RETURNING] dist={dist:.2f} m  '
+                f'pos=({self.current_x:.2f},{self.current_y:.2f})')
 
         # ── DONE ─────────────────────────────────────────────────────────────
         elif self.state == 'DONE':
