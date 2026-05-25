@@ -18,7 +18,7 @@ from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 
 # ── Robot namespace ────────────────────────────────────────────────────────────
-NAMESPACE = '/T12'
+NAMESPACE = '/T19'
 
 # ── Motion parameters ──────────────────────────────────────────────────────────
 FORWARD_SPEED    = 0.15      # m/s — waypoint navigation
@@ -27,7 +27,7 @@ AVOID_TURN_SPEED = 0.5       # rad/s — obstacle avoidance turns
 RETURN_SPEED     = 0.15      # m/s — return to start
 
 # ── Tolerances ─────────────────────────────────────────────────────────────────
-WAYPOINT_TOLERANCE  = 1.5    # m — close enough to waypoint to advance
+WAYPOINT_TOLERANCE  = 1    # m — close enough to waypoint to advance
 HEADING_TOLERANCE   = 0.15   # rad — wide dead-band to prevent oscillation
 RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
@@ -46,7 +46,7 @@ RED_LOW1   = np.array([0,   120, 70])
 RED_HIGH1  = np.array([10,  255, 255])
 RED_LOW2   = np.array([170, 120, 70])
 RED_HIGH2  = np.array([180, 255, 255])
-MIN_PIXELS = 20000
+MIN_PIXELS = 5000
 
 # ── Snapshot output path ───────────────────────────────────────────────────────
 SNAPSHOT_PATH = os.path.expanduser('~/Desktop/detection_snapshot.jpg')
@@ -225,6 +225,7 @@ class AutonomousSearch(Node):
         self.latest_scan       = None
         self.latest_image      = None
         self.cube_detected     = False
+        self.spin_dir         = 1.0   # default CCW; overwritten by _start_spin
 
         # ── Waypoints ────────────────────────────────────────────────────────
         self.waypoints      = self._load_waypoints()
@@ -431,28 +432,67 @@ class AutonomousSearch(Node):
 
     # ── Perimeter following ───────────────────────────────────────────────────
 
+    # ── Perimeter following ───────────────────────────────────────────────────
+
     def _perimeter_steer(self, target_x, target_y):
+        # Define the wall-tracking threshold at the top so AVOID can use it
+        MAX_TRACKING_DIST = PERIMETER_WALL_DIST * 1.5  
+
+        # 1. Obstacle Avoidance (Highest Priority)
         if self.nearest_front <= AVOID_DISTANCE:
-            return 0.0, -AVOID_TURN_SPEED
+            # Inside Corner Override:
+            # If we are following the left wall, turning left means doubling back.
+            # Force a right turn to continue the perimeter follow.
+            if self.nearest_left_side <= MAX_TRACKING_DIST:
+                avoid_dir = -1.0  # force right turn (CW)
+                avoid_reason = "tracking wall -> forcing right"
+            else:
+                # Open Space: Turn toward whichever side is more open.
+                if self.nearest_left >= self.nearest_right:
+                    avoid_dir = 1.0   # turn left (CCW)
+                    avoid_reason = "open space -> left more open"
+                else:
+                    avoid_dir = -1.0  # turn right (CW)
+                    avoid_reason = "open space -> right more open"
 
-        wall_err       = PERIMETER_WALL_DIST - self.nearest_left_side
-        wall_correction = PERIMETER_KP * wall_err
+            self.get_logger().info(
+                f'[AVOID] front={self.nearest_front:.2f} m  '
+                f'turning {"left" if avoid_dir > 0 else "right"} ({avoid_reason})')
+            return 0.0, avoid_dir * AVOID_TURN_SPEED
 
+        # 2. Calculate Heading to Waypoint
         target_angle = math.atan2(
             target_y - self.current_y,
             target_x - self.current_x)
         heading_err  = self._angle_diff(target_angle, self.current_yaw)
-        heading_bias = 0.3 * heading_err
 
+        # 3. Dynamic Navigation Modes
+        # MODE A: Open Space
+        if self.nearest_left_side > MAX_TRACKING_DIST:
+            nav_mode = "OPEN"
+            wall_correction = 0.0
+            heading_bias = 0.8 * heading_err  # Strong gain to align quickly
+            forward_speed = FORWARD_SPEED
+            
+        # MODE B: Wall Following
+        else:
+            nav_mode = "WALL"
+            wall_err = PERIMETER_WALL_DIST - self.nearest_left_side
+            wall_correction = PERIMETER_KP * wall_err
+            heading_bias = 0.3 * heading_err  # Weaker gain to prevent fighting the wall constraint
+            forward_speed = FORWARD_SPEED
+
+        # 4. Apply limits
         angular = float(np.clip(wall_correction + heading_bias,
                                 -AVOID_TURN_SPEED, AVOID_TURN_SPEED))
 
         self.get_logger().info(
-            f'[PERIM] left_wall={self.nearest_left_side:.2f} m  '
-            f'wall_err={wall_err:+.2f}  hdg_bias={math.degrees(heading_err):+.1f}°  '
+            f'[PERIM-{nav_mode}] left_wall={self.nearest_left_side:.2f} m  '
+            f'hdg_err={math.degrees(heading_err):+.1f}°  '
             f'ω={angular:+.2f}')
 
-        return FORWARD_SPEED, angular
+        return forward_speed, angular
+
 
     # ── 360° spin helpers ─────────────────────────────────────────────────────
 
@@ -462,10 +502,20 @@ class AutonomousSearch(Node):
         self.spin_last_yaw    = self.current_yaw
         self.spin_accumulated = 0.0
         self.cube_detected    = False   # clear stale detections from travel
+
+        # Choose spin direction based on which side has more open space.
+        # Positive → counter-clockwise (left), negative → clockwise (right).
+        if self.nearest_left >= self.nearest_right:
+            self.spin_dir = 1.0
+            dir_label = 'CCW (left more open)'
+        else:
+            self.spin_dir = -1.0
+            dir_label = 'CW (right more open)'
+
         self.get_logger().info(
             f'[SPIN] Starting 360° scan at '
             f'({self.current_x:.2f}, {self.current_y:.2f})  '
-            f'yaw₀={math.degrees(self.current_yaw):.1f}°')
+            f'yaw₀={math.degrees(self.current_yaw):.1f}°  dir={dir_label}')
 
     def _update_spin(self):
         """
@@ -524,7 +574,6 @@ class AutonomousSearch(Node):
         # ── CUBE_FINDING ─────────────────────────────────────────────────────
         elif self.state == 'CUBE_FINDING':
 
-            # Cube spotted mid-spin → stop and report
             if self.cube_detected:
                 self.stop()
                 self.get_logger().info(
@@ -533,8 +582,8 @@ class AutonomousSearch(Node):
                 self.state = 'REPORTING'
                 return
 
-            # Spin the robot counter-clockwise
-            self._publish_twist(0.0, SPIN_SPEED)
+            # Use the direction chosen at spin start
+            self._publish_twist(0.0, self.spin_dir * SPIN_SPEED)
 
             spin_done = self._update_spin()
             self.get_logger().info(
@@ -543,7 +592,6 @@ class AutonomousSearch(Node):
                 f'yaw={math.degrees(self.current_yaw):.1f}°')
 
             if spin_done:
-                # Full rotation complete, no cube → move to next waypoint
                 self.stop()
                 self.get_logger().info(
                     f'[CUBE_FINDING] 360° complete at WP{self.waypoint_index} — '
