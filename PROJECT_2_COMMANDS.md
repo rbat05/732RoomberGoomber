@@ -195,7 +195,7 @@ source ~/732RoomberGoomber/ros2_ws/install/setup.bash
 ```bash
 source ~/732RoomberGoomber/ros2_ws/install/setup.bash && \
 source /opt/ros/humble/setup.bash && \
-~/ros2_venv/bin/python3 -m tb4_sensor_reader.proj2_script
+~/ros2_venv/bin/python3 -m tb4_sensor_reader.proj2_script_wall_following
 ```
 
 ---

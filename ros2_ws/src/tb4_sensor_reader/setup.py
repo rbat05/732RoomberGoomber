@@ -38,6 +38,7 @@ setup(
             'proj2_script_gem=tb4_sensor_reader.proj2_script_gem:main',
             'proj2_script_wall_following=tb4_sensor_reader.proj2_script_wall_following:main',
             'homing_test=tb4_sensor_reader.homing_test:main',
+            'proj2_script_2_wall=tb4_sensor_reader.proj2_script_2_wall:main',
 
         ],
     },

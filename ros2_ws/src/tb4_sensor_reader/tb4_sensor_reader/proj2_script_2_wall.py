@@ -20,6 +20,12 @@ from cv_bridge import CvBridge
 # ── Robot namespace ────────────────────────────────────────────────────────────
 NAMESPACE = '/T12'
 
+# ── Obstacle avoidance ─────────────────────────────────────────────────────────
+AVOID_TURN_SPEED     = 0.5
+AVOID_DISTANCE       = 0.35
+AVOID_CLEAR_DIST     = 0.50   # m — front must be this clear before resuming
+AVOID_MIN_TURN_S     = 0.4    # s — minimum turn time before checking clear
+
 # ── Motion parameters ──────────────────────────────────────────────────────────
 FORWARD_SPEED    = 0.15      # m/s — waypoint navigation
 TURN_SPEED       = 0.4       # rad/s — waypoint navigation turns
@@ -55,10 +61,10 @@ SNAPSHOT_PATH = os.path.expanduser('~/Desktop/detection_snapshot.jpg')
 CUBE_FORWARD_ARC_DEG = 15    # degrees either side of forward for distance estimate
 LIDAR_FALLBACK_DIST  = 0.30  # m — used if forward arc returns no valid ranges
 
-# ── Perimeter following ────────────────────────────────────────────────────────
-PERIMETER_WALL_DIST  = 0.35  # m — desired distance from the left wall
-PERIMETER_KP         = 1.2   # proportional gain for wall-following correction
-PERIMETER_SIDE_ARC   = 20    # degrees either side of the 90° left beam
+CORRIDOR_SIDE_ARC    = 30    # degrees — cone half-width for left/right sensing
+CORRIDOR_KP          = 1.5   # proportional gain for lateral correction
+CORRIDOR_KD          = 0.4   # derivative gain (damps oscillation)
+CORRIDOR_TARGET_DIST = 0.50   # m — desired distance from each side wall
 
 # ── 360° spin (CUBE_FINDING state) ────────────────────────────────────────────
 SPIN_SPEED       = 0.3       # rad/s — rotation speed during cube-finding spin
@@ -67,6 +73,12 @@ SPIN_FULL_CIRCLE = 2 * math.pi  # radians — one complete revolution
 # ── Map paths ─────────────────────────────────────────────────────────────────
 PGM_MAP_PATH = os.path.expanduser('~/Desktop/lab_map.pgm')
 PGM_MAP_YAML = os.path.expanduser('~/Desktop/lab_map.yaml')
+
+
+# ── Corridor following (replaces perimeter following) ─────────────────────────
+CORRIDOR_SIDE_ARC    = 30    # degrees — cone half-width for left/right sensing
+CORRIDOR_KP          = 1.5   # proportional gain for lateral correction
+CORRIDOR_KD          = 0.4   # derivative gain (damps oscillation)
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
 MANUAL_WAYPOINTS = [
@@ -222,9 +234,14 @@ class AutonomousSearch(Node):
         self.nearest_left      = float('inf')
         self.nearest_right     = float('inf')
         self.nearest_left_side = float('inf')
+        self.nearest_right_side = float('inf')
+        self._corridor_prev_err = 0.0          # for derivative damping
         self.latest_scan       = None
         self.latest_image      = None
         self.cube_detected     = False
+        self._avoid_resume_state = 'WALL_FOLLOWING'
+        self._avoid_start_time = None
+        self._avoid_turn_dir = 0.0   # locked at avoidance entry, never changed mid-avoid
 
         # ── Waypoints ────────────────────────────────────────────────────────
         self.waypoints      = self._load_waypoints()
@@ -352,9 +369,11 @@ class AutonomousSearch(Node):
         self.nearest_left  = arc_min(front_i,          front_i + side_a)
         self.nearest_right = arc_min(front_i - side_a, front_i)
 
-        left_i  = front_i + int(round(math.radians(90) / inc))
-        left_hw = int(round(math.radians(PERIMETER_SIDE_ARC) / inc))
-        self.nearest_left_side = arc_min(left_i - left_hw, left_i + left_hw)
+        left_i   = front_i + int(round(math.radians(90) / inc))
+        right_i  = front_i - int(round(math.radians(90) / inc))
+        side_hw  = int(round(math.radians(CORRIDOR_SIDE_ARC) / inc))
+        self.nearest_left_side  = arc_min(left_i  - side_hw, left_i  + side_hw)
+        self.nearest_right_side = arc_min(right_i - side_hw, right_i + side_hw)
 
     def odom_callback(self, msg):
         pos = msg.pose.pose.position
@@ -431,26 +450,57 @@ class AutonomousSearch(Node):
 
     # ── Perimeter following ───────────────────────────────────────────────────
 
-    def _perimeter_steer(self, target_x, target_y):
-        if self.nearest_front <= AVOID_DISTANCE:
-            return 0.0, -AVOID_TURN_SPEED
+    def _avoidance_turn_dir(self):
+        """
+        Called ONCE when avoidance starts.
+        Turns toward whichever side has more clearance.
+        Returns +1.0 (CCW / left) or -1.0 (CW / right).
+        """
+        if self.nearest_left_side >= self.nearest_right_side:
+            return 1.0    # left side more open → turn left (CCW)
+        return -1.0       # right side more open → turn right (CW)
 
-        wall_err       = PERIMETER_WALL_DIST - self.nearest_left_side
-        wall_correction = PERIMETER_KP * wall_err
+    def _corridor_steer(self, target_x, target_y):
+        """
+        Pure corridor centering + weak heading bias.
+        Front obstacle handling is done externally by the AVOIDING state.
+        """
+        left  = self.nearest_left_side
+        right = self.nearest_right_side
 
-        target_angle = math.atan2(
-            target_y - self.current_y,
-            target_x - self.current_x)
+        WALL_MAX = 1.5
+        left_seen  = left  < WALL_MAX
+        right_seen = right < WALL_MAX
+
+        if left_seen and right_seen:
+            corridor_err = left - right
+            mode = 'BOTH'
+        elif left_seen:
+            corridor_err = -(CORRIDOR_TARGET_DIST - left)
+            mode = 'LEFT'
+        elif right_seen:
+            corridor_err = CORRIDOR_TARGET_DIST - right
+            mode = 'RIGHT'
+        else:
+            corridor_err = 0.0
+            mode = 'OPEN'
+
+        d_err = corridor_err - self._corridor_prev_err
+        self._corridor_prev_err = corridor_err
+        wall_correction = CORRIDOR_KP * corridor_err + CORRIDOR_KD * d_err
+
+        target_angle = math.atan2(target_y - self.current_y,
+                                target_x - self.current_x)
         heading_err  = self._angle_diff(target_angle, self.current_yaw)
-        heading_bias = 0.3 * heading_err
+        heading_bias = 0.15 * heading_err
 
         angular = float(np.clip(wall_correction + heading_bias,
                                 -AVOID_TURN_SPEED, AVOID_TURN_SPEED))
 
         self.get_logger().info(
-            f'[PERIM] left_wall={self.nearest_left_side:.2f} m  '
-            f'wall_err={wall_err:+.2f}  hdg_bias={math.degrees(heading_err):+.1f}°  '
-            f'ω={angular:+.2f}')
+            f'[CORRIDOR/{mode}] L={left:.2f} R={right:.2f}  '
+            f'err={corridor_err:+.3f}  d={d_err:+.3f}  '
+            f'hdg={math.degrees(heading_err):+.1f}°  ω={angular:+.3f}')
 
         return FORWARD_SPEED, angular
 
@@ -488,9 +538,42 @@ class AutonomousSearch(Node):
                 self.stop()
                 self.state = 'RETURNING'
                 return
+            
+        # ── AVOIDING ─────────────────────────────────────────────────────────────
+        if self.state == 'AVOIDING':
+            front_clear = self.nearest_front > AVOID_CLEAR_DIST
+            elapsed     = time.time() - self._avoid_start_time
+
+            if front_clear and elapsed >= AVOID_MIN_TURN_S:
+                self.stop()
+                self.get_logger().info(
+                    f'[AVOIDING] Front clear ({self.nearest_front:.2f} m) '
+                    f'after {elapsed:.1f} s — resuming {self._avoid_resume_state}')
+                self._corridor_prev_err = 0.0
+                self.state = self._avoid_resume_state
+                return
+
+            # Use the direction locked at entry — never re-evaluate
+            self._publish_twist(0.0, self._avoid_turn_dir * AVOID_TURN_SPEED)
+            self.get_logger().info(
+                f'[AVOIDING] front={self.nearest_front:.2f} m  '
+                f'elapsed={elapsed:.1f} s  '
+                f'turn={"CCW" if self._avoid_turn_dir > 0 else "CW"}')
+            return
 
         # ── WALL_FOLLOWING ───────────────────────────────────────────────────
         if self.state == 'WALL_FOLLOWING':
+            if self.nearest_front <= AVOID_DISTANCE:
+                self.stop()
+                self._avoid_start_time   = time.time()
+                self._avoid_resume_state = 'WALL_FOLLOWING'
+                self._avoid_turn_dir     = self._avoidance_turn_dir()   # locked here
+                self.state = 'AVOIDING'
+                self.get_logger().info(
+                    f'[WALL_FOLLOWING] Obstacle at {self.nearest_front:.2f} m → AVOIDING '
+                    f'(turn={"CCW" if self._avoid_turn_dir > 0 else "CW"})')
+                return
+
 
             if self.waypoint_index >= len(self.waypoints):
                 self.get_logger().warn(
@@ -512,7 +595,8 @@ class AutonomousSearch(Node):
                 self.state = 'CUBE_FINDING'
                 return
 
-            linear, angular = self._perimeter_steer(target_x, target_y)
+            linear, angular = self._corridor_steer(target_x, target_y)
+
             self._publish_twist(linear, angular)
 
             self.get_logger().info(
@@ -550,6 +634,7 @@ class AutonomousSearch(Node):
                     f'no cube found, advancing to next waypoint')
                 self.waypoint_index += 1
                 self.state = 'WALL_FOLLOWING'
+                self._avoid_start_time = None   # when avoidance began
 
         # ── REPORTING ────────────────────────────────────────────────────────
         elif self.state == 'REPORTING':
@@ -568,6 +653,16 @@ class AutonomousSearch(Node):
 
         # ── RETURNING ────────────────────────────────────────────────────────
         elif self.state == 'RETURNING':
+            if self.nearest_front <= AVOID_DISTANCE:
+                self.stop()
+                self._avoid_start_time   = time.time()
+                self._avoid_resume_state = 'RETURNING'
+                self._avoid_turn_dir     = self._avoidance_turn_dir()   # locked here
+                self.state = 'AVOIDING'
+                self.get_logger().info(
+                    f'[RETURNING] Obstacle at {self.nearest_front:.2f} m → AVOIDING '
+                    f'(turn={"CCW" if self._avoid_turn_dir > 0 else "CW"})')
+                return
             dist = self._distance_to(0.0, 0.0)
 
             if dist < RETURN_TOLERANCE:
@@ -579,7 +674,7 @@ class AutonomousSearch(Node):
                 self.state = 'DONE'
                 return
 
-            linear, angular = self._perimeter_steer(0.0, 0.0)
+            linear, angular = self._corridor_steer(0.0, 0.0)
             self._publish_twist(linear, angular)
 
             self.get_logger().info(
