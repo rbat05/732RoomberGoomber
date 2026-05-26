@@ -9,7 +9,7 @@ To run:
     ~/ros2_venv/bin/python3 -m tb4_sensor_reader.autonomous_search
 """
 
-import rclpy, cv2, math, os, time
+import rclpy, cv2, math, os, time, sys
 import numpy as np
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -18,7 +18,7 @@ from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 
 # ── Robot namespace ────────────────────────────────────────────────────────────
-NAMESPACE = '/T7'
+NAMESPACE = '/T13'
 
 # ── Motion parameters ──────────────────────────────────────────────────────────
 FORWARD_SPEED    = 0.15      # m/s — waypoint navigation
@@ -30,7 +30,7 @@ WAYPOINT_TOLERANCE  = 1    # m — close enough to waypoint to advance
 RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
 # ── Obstacle avoidance ─────────────────────────────────────────────────────────
-AVOID_DISTANCE      = 0.25    # m — obstacle trigger distance
+AVOID_DISTANCE      = 0.3    # m — obstacle trigger distance
 FRONT_ARC_DEG       = 60     # degrees — front detection arc width
 LIDAR_OFFSET_DEG    = -90    # degrees — LiDAR mounting offset
 LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
@@ -58,24 +58,23 @@ PERIMETER_KP         = 1.2   # proportional gain for wall-following correction
 PERIMETER_SIDE_ARC   = 20    # degrees either side of the 90° left beam
 
 # ── 360° spin (CUBE_FINDING state) ────────────────────────────────────────────
-SPIN_SPEED       = 0.3       # rad/s — rotation speed during cube-finding spin
+SPIN_SPEED       = 1       # rad/s — rotation speed during cube-finding spin
 SPIN_FULL_CIRCLE = 2 * math.pi  # radians — one complete revolution
 
 # ── Map paths ─────────────────────────────────────────────────────────────────
-PGM_MAP_PATH = os.path.expanduser('~/Desktop/lab_map_c_test.pgm')
-PGM_MAP_YAML = os.path.expanduser('~/Desktop/lab_map_c_test.yaml')
+PGM_MAP_PATH = os.path.expanduser('~/Desktop/lab_map_c_2.pgm')
+PGM_MAP_YAML = os.path.expanduser('~/Desktop/lab_map_c_2.yaml')
 
 
 CUBE_SEARCH_STEP_M   = 0.20   # m — nudge forward each retry
 CUBE_SEARCH_MAX_SPINS = 1     # full 360s before nudging
 
-STUCK_CHECK_WINDOW_S  = 5.0   # seconds — history window for stuck detection
+STUCK_CHECK_WINDOW_S  = 10   # seconds — history window for stuck detection
 STUCK_MIN_DIST_M      = 0.10  # m — if less than this in window, consider stuck
 
-STUCK_TURN_SPEED  = 0.5        # rad/s — turn speed when unsticking
-STUCK_TURN_ANGLE  = math.pi    # 180° turn
-STUCK_DRIVE_DIST  = 0.30       # m — forward distance after the turn
-STUCK_DRIVE_SPEED = 0.15       # m/s — forward speed when unsticking
+STUCK_BACKUP_SPEED = -0.15     # m/s — reverse speed when unsticking
+STUCK_BACKUP_DIST  = 0.30      # m — distance to reverse
+STUCK_BACKUP_TIMEOUT_S = 4.0
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
 MANUAL_WAYPOINTS = [
@@ -248,6 +247,7 @@ class AutonomousSearch(Node):
         self.unstick_drive_start_y = None
         self.backup_start_x    = None
         self.backup_start_y    = None
+        self.unstick_backup_start_t = 0.0
 
         # ── Waypoints ────────────────────────────────────────────────────────
         self.waypoints      = self._load_waypoints()
@@ -267,7 +267,24 @@ class AutonomousSearch(Node):
         #   REPORTING      → log cube location, save snapshot
         #   RETURNING      → drive back to origin
         #   DONE           → stop and report results
-        self.state      = 'WALL_FOLLOWING'
+
+        # ── Resume mode from command-line argument ────────────────────────────────
+        resume_mode = None
+        for arg in sys.argv[1:]:
+            if arg.startswith('--resume='):
+                resume_mode = arg.split('=', 1)[1].upper()
+
+        if resume_mode == 'RETURN':
+            self.state = 'RETURNING'
+            self.get_logger().info('Resume mode: RETURNING — navigating directly to origin')
+        elif resume_mode == 'SEARCH':
+            # Jump to next waypoint (skip already-visited ones if desired)
+            self.state = 'WALL_FOLLOWING'
+            self.get_logger().info(f'Resume mode: SEARCH — resuming from waypoint {self.waypoint_index}')
+        else:
+            self.state = 'WALL_FOLLOWING'
+            self.get_logger().info('Normal start — beginning from waypoint 0')
+
         self.start_time = time.time()
 
         # ── Reported results ──────────────────────────────────────────────────
@@ -306,73 +323,35 @@ class AutonomousSearch(Node):
 
     def _handle_stuck(self):
         """
-        3-phase unstick: 180° turn → drive 30cm → 180° turn back.
+        Unstick by reversing 30 cm.
         Returns True while unsticking (caller must return immediately).
         """
         if self.unsticking:
-            phase = self.unstick_phase
+            elapsed = time.time() - self.unstick_backup_start_t   # add this
 
-            # ── TURN1 / TURN2: spin 180° ─────────────────────────────────
-            if phase in ('TURN1', 'TURN2'):
-                delta = abs(self._angle_diff(self.current_yaw, self.unstick_turn_last_yaw))
-                self.unstick_turn_acc      += delta
-                self.unstick_turn_last_yaw  = self.current_yaw
-                self.get_logger().info(
-                    f'[STUCK-{phase}] rotated={math.degrees(self.unstick_turn_acc):.1f}° / 180°')
+            dist = math.sqrt(
+                (self.current_x - self.unstick_drive_start_x) ** 2 +
+                (self.current_y - self.unstick_drive_start_y) ** 2)
+            self.get_logger().info(
+                f'[STUCK-BACKUP] reversed={dist:.2f}/{STUCK_BACKUP_DIST:.2f} m')
 
-                if self.unstick_turn_acc >= STUCK_TURN_ANGLE:
-                    self.stop()
-                    if phase == 'TURN1':
-                        # Transition to DRIVE
-                        self.unstick_phase          = 'DRIVE'
-                        self.unstick_drive_start_x  = self.current_x
-                        self.unstick_drive_start_y  = self.current_y
-                        self.get_logger().info('[STUCK] TURN1 done → DRIVE')
-                    else:
-                        # TURN2 done — fully unstuck
-                        self.unsticking = False
-                        self.unstick_phase = None
-                        self.pos_history.clear()
-                        self.get_logger().info('[STUCK] TURN2 done — resuming normally')
-                else:
-                    self._publish_twist(0.0, STUCK_TURN_SPEED)
-                return True
+            if dist >= STUCK_BACKUP_DIST or elapsed >= STUCK_BACKUP_TIMEOUT_S:
+                self.stop()
+                self.unsticking = False
+                self.pos_history.clear()
+                self.get_logger().warn(
+                    f'[STUCK] Backup ended — dist={dist:.2f} m  elapsed={elapsed:.1f} s')
+            else:
+                self._publish_twist(STUCK_BACKUP_SPEED, 0.3)
+            return True
 
-            # ── DRIVE: go forward 30cm ────────────────────────────────────
-            if phase == 'DRIVE':
-                dist = math.sqrt(
-                    (self.current_x - self.unstick_drive_start_x) ** 2 +
-                    (self.current_y - self.unstick_drive_start_y) ** 2)
-                self.get_logger().info(
-                    f'[STUCK-DRIVE] moved={dist:.2f}/{STUCK_DRIVE_DIST:.2f} m')
-
-                if dist >= STUCK_DRIVE_DIST:
-                    self.stop()
-                    # Transition to TURN2
-                    self.unstick_phase         = 'TURN2'
-                    self.unstick_turn_acc      = 0.0
-                    self.unstick_turn_last_yaw = self.current_yaw
-                    self.get_logger().info('[STUCK] DRIVE done → TURN2')
-                else:
-                    if self.nearest_front <= AVOID_DISTANCE:
-                        # Obstacle ahead during drive — skip straight to TURN2
-                        self.stop()
-                        self.unstick_phase         = 'TURN2'
-                        self.unstick_turn_acc      = 0.0
-                        self.unstick_turn_last_yaw = self.current_yaw
-                        self.get_logger().warn('[STUCK] Obstacle during DRIVE — skipping to TURN2')
-                    else:
-                        self._publish_twist(STUCK_DRIVE_SPEED, 0.0)
-                return True
-
-        # ── Not currently unsticking — check if we should start ──────────
         if self._is_stuck():
-            self.get_logger().warn('[STUCK] Detected — starting 180°/drive/180° manoeuvre')
+            self.get_logger().warn('[STUCK] Detected — reversing')
             self.unsticking            = True
-            self.unstick_phase         = 'TURN1'
-            self.unstick_turn_acc      = 0.0
-            self.unstick_turn_last_yaw = self.current_yaw
-            self._publish_twist(0.0, STUCK_TURN_SPEED)
+            self.unstick_backup_start_t = time.time()   # ← add this line
+            self.unstick_drive_start_x = self.current_x
+            self.unstick_drive_start_y = self.current_y
+            self._publish_twist(STUCK_BACKUP_SPEED, 0.0)
             return True
 
         return False
