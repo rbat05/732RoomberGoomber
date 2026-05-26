@@ -70,11 +70,14 @@ CUBE_SEARCH_STEP_M   = 0.20   # m — nudge forward each retry
 CUBE_SEARCH_MAX_SPINS = 1     # full 360s before nudging
 
 STUCK_CHECK_WINDOW_S  = 10   # seconds — history window for stuck detection
-STUCK_MIN_DIST_M      = 0.10  # m — if less than this in window, consider stuck
+STUCK_MIN_DIST_M      = 0.05  # m — if less than this in window, consider stuck
 
 STUCK_BACKUP_SPEED = -0.15     # m/s — reverse speed when unsticking
 STUCK_BACKUP_DIST  = 0.30      # m — distance to reverse
 STUCK_BACKUP_TIMEOUT_S = 4.0
+
+STUCK_EXIT_TURN_SPEED = 0.4    # rad/s — turn after backup to unstick
+STUCK_EXIT_TURN_DUR_S = 1.0    # seconds — how long to turn
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
 MANUAL_WAYPOINTS = [
@@ -248,6 +251,7 @@ class AutonomousSearch(Node):
         self.backup_start_x    = None
         self.backup_start_y    = None
         self.unstick_backup_start_t = 0.0
+        self.unstick_exit_turn_start_t = None  # set when exit turn begins
 
         # ── Waypoints ────────────────────────────────────────────────────────
         self.waypoints      = self._load_waypoints()
@@ -338,9 +342,10 @@ class AutonomousSearch(Node):
             if dist >= STUCK_BACKUP_DIST or elapsed >= STUCK_BACKUP_TIMEOUT_S:
                 self.stop()
                 self.unsticking = False
+                self.unstick_exit_turn_start_t = time.time()
                 self.pos_history.clear()
                 self.get_logger().warn(
-                    f'[STUCK] Backup ended — dist={dist:.2f} m  elapsed={elapsed:.1f} s')
+                    f'[STUCK] Backup ended — dist={dist:.2f} m  elapsed={elapsed:.1f} s — starting exit turn')
             else:
                 self._publish_twist(STUCK_BACKUP_SPEED, 0.3)
             return True
@@ -353,6 +358,18 @@ class AutonomousSearch(Node):
             self.unstick_drive_start_y = self.current_y
             self._publish_twist(STUCK_BACKUP_SPEED, 0.0)
             return True
+        
+        # ── Exit turn after backup ────────────────────────────────────────────
+        if self.unstick_exit_turn_start_t is not None:
+            turn_elapsed = time.time() - self.unstick_exit_turn_start_t
+            if turn_elapsed < STUCK_EXIT_TURN_DUR_S:
+                self._publish_twist(0.0, STUCK_EXIT_TURN_SPEED)
+                self.get_logger().info(
+                    f'[STUCK-EXIT-TURN] {turn_elapsed:.1f}/{STUCK_EXIT_TURN_DUR_S:.1f} s')
+                return True
+            else:
+                self.unstick_exit_turn_start_t = None
+                self.get_logger().info('[STUCK] Exit turn done — resuming normally')
 
         return False
 
