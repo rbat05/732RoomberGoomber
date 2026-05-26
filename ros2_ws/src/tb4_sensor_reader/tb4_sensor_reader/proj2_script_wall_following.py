@@ -18,22 +18,19 @@ from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 
 # ── Robot namespace ────────────────────────────────────────────────────────────
-NAMESPACE = '/T19'
+NAMESPACE = '/T7'
 
 # ── Motion parameters ──────────────────────────────────────────────────────────
 FORWARD_SPEED    = 0.15      # m/s — waypoint navigation
-TURN_SPEED       = 0.4       # rad/s — waypoint navigation turns
+TURN_SPEED       = 0.8       # rad/s — waypoint navigation turns
 AVOID_TURN_SPEED = 0.5       # rad/s — obstacle avoidance turns
-RETURN_SPEED     = 0.15      # m/s — return to start
 
 # ── Tolerances ─────────────────────────────────────────────────────────────────
 WAYPOINT_TOLERANCE  = 1    # m — close enough to waypoint to advance
-HEADING_TOLERANCE   = 0.15   # rad — wide dead-band to prevent oscillation
 RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
 # ── Obstacle avoidance ─────────────────────────────────────────────────────────
-AVOID_DISTANCE      = 0.35    # m — obstacle trigger distance
-AVOID_CLEAR_DIST    = 0.35    # m — must be clear before resuming navigation
+AVOID_DISTANCE      = 0.25    # m — obstacle trigger distance
 FRONT_ARC_DEG       = 60     # degrees — front detection arc width
 LIDAR_OFFSET_DEG    = -90    # degrees — LiDAR mounting offset
 LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
@@ -42,9 +39,9 @@ LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
 TIME_LIMIT_S = 420.0         # 7 minutes — force RETURNING if cube not found
 
 # ── Red cube detection ─────────────────────────────────────────────────────────
-RED_LOW1   = np.array([0,   120, 70])
-RED_HIGH1  = np.array([10,  255, 255])
-RED_LOW2   = np.array([170, 120, 70])
+RED_LOW1   = np.array([0,   150, 100])
+RED_HIGH1  = np.array([8,   255, 255])
+RED_LOW2   = np.array([172, 150, 100])
 RED_HIGH2  = np.array([180, 255, 255])
 MIN_PIXELS = 5000
 
@@ -65,8 +62,20 @@ SPIN_SPEED       = 0.3       # rad/s — rotation speed during cube-finding spin
 SPIN_FULL_CIRCLE = 2 * math.pi  # radians — one complete revolution
 
 # ── Map paths ─────────────────────────────────────────────────────────────────
-PGM_MAP_PATH = os.path.expanduser('~/Desktop/lab_map.pgm')
-PGM_MAP_YAML = os.path.expanduser('~/Desktop/lab_map.yaml')
+PGM_MAP_PATH = os.path.expanduser('~/Desktop/lab_map_c_test.pgm')
+PGM_MAP_YAML = os.path.expanduser('~/Desktop/lab_map_c_test.yaml')
+
+
+CUBE_SEARCH_STEP_M   = 0.20   # m — nudge forward each retry
+CUBE_SEARCH_MAX_SPINS = 1     # full 360s before nudging
+
+STUCK_CHECK_WINDOW_S  = 5.0   # seconds — history window for stuck detection
+STUCK_MIN_DIST_M      = 0.10  # m — if less than this in window, consider stuck
+
+STUCK_TURN_SPEED  = 0.5        # rad/s — turn speed when unsticking
+STUCK_TURN_ANGLE  = math.pi    # 180° turn
+STUCK_DRIVE_DIST  = 0.30       # m — forward distance after the turn
+STUCK_DRIVE_SPEED = 0.15       # m/s — forward speed when unsticking
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
 MANUAL_WAYPOINTS = [
@@ -226,6 +235,19 @@ class AutonomousSearch(Node):
         self.latest_image      = None
         self.cube_detected     = False
         self.spin_dir         = 1.0   # default CCW; overwritten by _start_spin
+        self.spin_count        = 0     # spins completed at current position
+        self.nudge_start_x     = None  # position when nudge began
+        self.nudge_start_y     = None
+        self.nudging           = False  # True while driving the 20cm step
+        self.pos_history       = []    # list of (timestamp, x, y)
+        self.unsticking        = False
+        self.unstick_phase     = None   # 'TURN1', 'DRIVE', 'TURN2'
+        self.unstick_turn_acc  = 0.0
+        self.unstick_turn_last_yaw = None
+        self.unstick_drive_start_x = None
+        self.unstick_drive_start_y = None
+        self.backup_start_x    = None
+        self.backup_start_y    = None
 
         # ── Waypoints ────────────────────────────────────────────────────────
         self.waypoints      = self._load_waypoints()
@@ -259,6 +281,101 @@ class AutonomousSearch(Node):
             f'Autonomous search started — {len(self.waypoints)} waypoints loaded')
         for i, wp in enumerate(self.waypoints):
             self.get_logger().info(f'  Waypoint {i}: {wp}')
+
+    def _record_position(self):
+        """Call every control tick to maintain a rolling position history."""
+        now = time.time()
+        self.pos_history.append((now, self.current_x, self.current_y))
+        # Trim entries older than the window
+        cutoff = now - STUCK_CHECK_WINDOW_S
+        self.pos_history = [(t, x, y) for t, x, y in self.pos_history if t >= cutoff]
+
+    def _is_stuck(self):
+        if len(self.pos_history) < 2:
+            return False
+        # Don't trigger until the window is actually full
+        window_duration = self.pos_history[-1][0] - self.pos_history[0][0]
+        if window_duration < STUCK_CHECK_WINDOW_S * 0.9:
+            return False
+        total = 0.0
+        for i in range(1, len(self.pos_history)):
+            _, x0, y0 = self.pos_history[i - 1]
+            _, x1, y1 = self.pos_history[i]
+            total += math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+        return total < STUCK_MIN_DIST_M
+
+    def _handle_stuck(self):
+        """
+        3-phase unstick: 180° turn → drive 30cm → 180° turn back.
+        Returns True while unsticking (caller must return immediately).
+        """
+        if self.unsticking:
+            phase = self.unstick_phase
+
+            # ── TURN1 / TURN2: spin 180° ─────────────────────────────────
+            if phase in ('TURN1', 'TURN2'):
+                delta = abs(self._angle_diff(self.current_yaw, self.unstick_turn_last_yaw))
+                self.unstick_turn_acc      += delta
+                self.unstick_turn_last_yaw  = self.current_yaw
+                self.get_logger().info(
+                    f'[STUCK-{phase}] rotated={math.degrees(self.unstick_turn_acc):.1f}° / 180°')
+
+                if self.unstick_turn_acc >= STUCK_TURN_ANGLE:
+                    self.stop()
+                    if phase == 'TURN1':
+                        # Transition to DRIVE
+                        self.unstick_phase          = 'DRIVE'
+                        self.unstick_drive_start_x  = self.current_x
+                        self.unstick_drive_start_y  = self.current_y
+                        self.get_logger().info('[STUCK] TURN1 done → DRIVE')
+                    else:
+                        # TURN2 done — fully unstuck
+                        self.unsticking = False
+                        self.unstick_phase = None
+                        self.pos_history.clear()
+                        self.get_logger().info('[STUCK] TURN2 done — resuming normally')
+                else:
+                    self._publish_twist(0.0, STUCK_TURN_SPEED)
+                return True
+
+            # ── DRIVE: go forward 30cm ────────────────────────────────────
+            if phase == 'DRIVE':
+                dist = math.sqrt(
+                    (self.current_x - self.unstick_drive_start_x) ** 2 +
+                    (self.current_y - self.unstick_drive_start_y) ** 2)
+                self.get_logger().info(
+                    f'[STUCK-DRIVE] moved={dist:.2f}/{STUCK_DRIVE_DIST:.2f} m')
+
+                if dist >= STUCK_DRIVE_DIST:
+                    self.stop()
+                    # Transition to TURN2
+                    self.unstick_phase         = 'TURN2'
+                    self.unstick_turn_acc      = 0.0
+                    self.unstick_turn_last_yaw = self.current_yaw
+                    self.get_logger().info('[STUCK] DRIVE done → TURN2')
+                else:
+                    if self.nearest_front <= AVOID_DISTANCE:
+                        # Obstacle ahead during drive — skip straight to TURN2
+                        self.stop()
+                        self.unstick_phase         = 'TURN2'
+                        self.unstick_turn_acc      = 0.0
+                        self.unstick_turn_last_yaw = self.current_yaw
+                        self.get_logger().warn('[STUCK] Obstacle during DRIVE — skipping to TURN2')
+                    else:
+                        self._publish_twist(STUCK_DRIVE_SPEED, 0.0)
+                return True
+
+        # ── Not currently unsticking — check if we should start ──────────
+        if self._is_stuck():
+            self.get_logger().warn('[STUCK] Detected — starting 180°/drive/180° manoeuvre')
+            self.unsticking            = True
+            self.unstick_phase         = 'TURN1'
+            self.unstick_turn_acc      = 0.0
+            self.unstick_turn_last_yaw = self.current_yaw
+            self._publish_twist(0.0, STUCK_TURN_SPEED)
+            return True
+
+        return False
 
     # ── Waypoint loading ──────────────────────────────────────────────────────
 
@@ -435,62 +552,60 @@ class AutonomousSearch(Node):
     # ── Perimeter following ───────────────────────────────────────────────────
 
     def _perimeter_steer(self, target_x, target_y):
-        # Define the wall-tracking threshold at the top so AVOID can use it
-        MAX_TRACKING_DIST = PERIMETER_WALL_DIST * 1.5  
+        MAX_TRACKING_DIST = PERIMETER_WALL_DIST * 1.5
 
         # 1. Obstacle Avoidance (Highest Priority)
         if self.nearest_front <= AVOID_DISTANCE:
-            # Inside Corner Override:
-            # If we are following the left wall, turning left means doubling back.
-            # Force a right turn to continue the perimeter follow.
             if self.nearest_left_side <= MAX_TRACKING_DIST:
-                avoid_dir = -1.0  # force right turn (CW)
+                avoid_dir = -1.0
                 avoid_reason = "tracking wall -> forcing right"
             else:
-                # Open Space: Turn toward whichever side is more open.
                 if self.nearest_left >= self.nearest_right:
-                    avoid_dir = 1.0   # turn left (CCW)
+                    avoid_dir = 1.0
                     avoid_reason = "open space -> left more open"
                 else:
-                    avoid_dir = -1.0  # turn right (CW)
+                    avoid_dir = -1.0
                     avoid_reason = "open space -> right more open"
-
             self.get_logger().info(
                 f'[AVOID] front={self.nearest_front:.2f} m  '
                 f'turning {"left" if avoid_dir > 0 else "right"} ({avoid_reason})')
             return 0.0, avoid_dir * AVOID_TURN_SPEED
 
-        # 2. Calculate Heading to Waypoint
+        # 2. RIGHT-WALL GUARD (new) ──────────────────────────────────────────
+        RIGHT_SAFETY_DIST = 0.6
+        if self.nearest_right < RIGHT_SAFETY_DIST:
+            right_push = PERIMETER_KP * (RIGHT_SAFETY_DIST - self.nearest_right)
+            angular = float(np.clip(right_push, 0.0, AVOID_TURN_SPEED))
+            self.get_logger().info(
+                f'[RIGHT-GUARD] right={self.nearest_right:.2f} m  pushing left ω={angular:+.2f}')
+            return FORWARD_SPEED * 0.7, angular
+        # ────────────────────────────────────────────────────────────────────
+
+        # 3. Calculate Heading to Waypoint
         target_angle = math.atan2(
             target_y - self.current_y,
             target_x - self.current_x)
-        heading_err  = self._angle_diff(target_angle, self.current_yaw)
+        heading_err = self._angle_diff(target_angle, self.current_yaw)
 
-        # 3. Dynamic Navigation Modes
-        # MODE A: Open Space
+        # 4. Dynamic Navigation Modes
         if self.nearest_left_side > MAX_TRACKING_DIST:
             nav_mode = "OPEN"
             wall_correction = 0.0
-            heading_bias = 0.8 * heading_err  # Strong gain to align quickly
+            heading_bias = 0.8 * heading_err
             forward_speed = FORWARD_SPEED
-            
-        # MODE B: Wall Following
         else:
             nav_mode = "WALL"
             wall_err = PERIMETER_WALL_DIST - self.nearest_left_side
             wall_correction = PERIMETER_KP * wall_err
-            heading_bias = 0.3 * heading_err  # Weaker gain to prevent fighting the wall constraint
+            heading_bias = 0.3 * heading_err
             forward_speed = FORWARD_SPEED
 
-        # 4. Apply limits
         angular = float(np.clip(wall_correction + heading_bias,
                                 -AVOID_TURN_SPEED, AVOID_TURN_SPEED))
-
         self.get_logger().info(
             f'[PERIM-{nav_mode}] left_wall={self.nearest_left_side:.2f} m  '
             f'hdg_err={math.degrees(heading_err):+.1f}°  '
             f'ω={angular:+.2f}')
-
         return forward_speed, angular
 
 
@@ -538,9 +653,16 @@ class AutonomousSearch(Node):
                 self.stop()
                 self.state = 'RETURNING'
                 return
+            
+        # ── Position history (only during moving states) ──────────────────────
+        if self.state in ('WALL_FOLLOWING', 'RETURNING'):
+            self._record_position()
 
         # ── WALL_FOLLOWING ───────────────────────────────────────────────────
         if self.state == 'WALL_FOLLOWING':
+
+            if self._handle_stuck():
+                return
 
             if self.waypoint_index >= len(self.waypoints):
                 self.get_logger().warn(
@@ -573,31 +695,70 @@ class AutonomousSearch(Node):
 
         # ── CUBE_FINDING ─────────────────────────────────────────────────────
         elif self.state == 'CUBE_FINDING':
-
             if self.cube_detected:
                 self.stop()
                 self.get_logger().info(
-                    f'[CUBE_FINDING] Red cube detected at WP{self.waypoint_index} '
-                    f'— transitioning to REPORTING')
+                    f'[CUBE_FINDING] Red cube detected — transitioning to REPORTING')
                 self.state = 'REPORTING'
                 return
 
-            # Use the direction chosen at spin start
-            self._publish_twist(0.0, self.spin_dir * SPIN_SPEED)
+            # ── Nudging forward 20cm before respinning ───────────────────────
+            if self.nudging:
+                dist_nudged = math.sqrt(
+                    (self.current_x - self.nudge_start_x) ** 2 +
+                    (self.current_y - self.nudge_start_y) ** 2)
+                self.get_logger().info(
+                    f'[NUDGE] moved={dist_nudged:.2f} m / {CUBE_SEARCH_STEP_M:.2f} m')
 
+                if dist_nudged >= CUBE_SEARCH_STEP_M:
+                    # Nudge complete — start a fresh spin
+                    self.stop()
+                    self.nudging    = False
+                    self.spin_count = 0
+                    self._start_spin()
+                    self.get_logger().info('[NUDGE] Complete — starting fresh spin')
+                else:
+                    # Keep nudging, but still respect obstacle avoidance
+                    if self.nearest_front <= AVOID_DISTANCE:
+                        self.stop()
+                        self.get_logger().warn(
+                            '[NUDGE] Obstacle during nudge — aborting nudge, respinning')
+                        self.nudging    = False
+                        self.spin_count = 0
+                        self._start_spin()
+                    else:
+                        self._publish_twist(FORWARD_SPEED, 0.0)
+                return
+
+            # ── Spinning ─────────────────────────────────────────────────────
+            self._publish_twist(0.0, self.spin_dir * SPIN_SPEED)
             spin_done = self._update_spin()
             self.get_logger().info(
-                f'[CUBE_FINDING] WP{self.waypoint_index}  '
+                f'[CUBE_FINDING] spin={self.spin_count+1}/{CUBE_SEARCH_MAX_SPINS}  '
                 f'rotated={math.degrees(self.spin_accumulated):.1f}°  '
                 f'yaw={math.degrees(self.current_yaw):.1f}°')
 
             if spin_done:
                 self.stop()
+                self.spin_count += 1
                 self.get_logger().info(
-                    f'[CUBE_FINDING] 360° complete at WP{self.waypoint_index} — '
-                    f'no cube found, advancing to next waypoint')
-                self.waypoint_index += 1
-                self.state = 'WALL_FOLLOWING'
+                    f'[CUBE_FINDING] 360° complete ({self.spin_count}/{CUBE_SEARCH_MAX_SPINS})')
+
+                if self.spin_count >= CUBE_SEARCH_MAX_SPINS:
+                    # Enough spins — nudge forward and try again
+                    self.get_logger().info(
+                        f'[CUBE_FINDING] {CUBE_SEARCH_MAX_SPINS} spins done, no cube — '
+                        f'nudging {CUBE_SEARCH_STEP_M:.2f} m forward')
+                    self.nudging       = True
+                    self.nudge_start_x = self.current_x
+                    self.nudge_start_y = self.current_y
+                else:
+                    # Do another spin in the opposite direction for coverage
+                    self.spin_dir = -self.spin_dir
+                    self._start_spin()
+                    self.get_logger().info(
+                        f'[CUBE_FINDING] Starting spin {self.spin_count+1} '
+                        f'({"CCW" if self.spin_dir > 0 else "CW"})')
 
         # ── REPORTING ────────────────────────────────────────────────────────
         elif self.state == 'REPORTING':
@@ -616,6 +777,10 @@ class AutonomousSearch(Node):
 
         # ── RETURNING ────────────────────────────────────────────────────────
         elif self.state == 'RETURNING':
+
+            if self._handle_stuck():
+                return
+
             dist = self._distance_to(0.0, 0.0)
 
             if dist < RETURN_TOLERANCE:

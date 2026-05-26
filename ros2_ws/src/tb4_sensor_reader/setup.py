@@ -40,6 +40,7 @@ setup(
             'homing_test=tb4_sensor_reader.homing_test:main',
             'proj2_script_2_wall=tb4_sensor_reader.proj2_script_2_wall:main',
             'proj2_script_slam=tb4_sensor_reader.proj2_script_slam:main',
+            'offset_test=tb4_sensor_reader.offset_test:main',
 
         ],
     },
