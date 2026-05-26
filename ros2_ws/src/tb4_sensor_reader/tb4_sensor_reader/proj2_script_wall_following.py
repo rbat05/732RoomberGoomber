@@ -70,14 +70,14 @@ CUBE_SEARCH_STEP_M   = 0.20   # m — nudge forward each retry
 CUBE_SEARCH_MAX_SPINS = 1     # full 360s before nudging
 
 STUCK_CHECK_WINDOW_S  = 10   # seconds — history window for stuck detection
-STUCK_MIN_DIST_M      = 0.05  # m — if less than this in window, consider stuck
+STUCK_MIN_DIST_M      = 0.1  # m — if less than this in window, consider stuck
 
-STUCK_BACKUP_SPEED = -0.15     # m/s — reverse speed when unsticking
-STUCK_BACKUP_DIST  = 0.30      # m — distance to reverse
-STUCK_BACKUP_TIMEOUT_S = 4.0
+STUCK_BACKUP_SPEED = -0.1     # m/s — reverse speed when unsticking
+STUCK_BACKUP_DIST  = 0.5      # m — distance to reverse
+STUCK_BACKUP_TIMEOUT_S = 10
 
 STUCK_EXIT_TURN_SPEED = 0.4    # rad/s — turn after backup to unstick
-STUCK_EXIT_TURN_DUR_S = 1.0    # seconds — how long to turn
+STUCK_EXIT_TURN_DUR_S = 1.5    # seconds — how long to turn
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
 MANUAL_WAYPOINTS = [
@@ -252,6 +252,8 @@ class AutonomousSearch(Node):
         self.backup_start_y    = None
         self.unstick_backup_start_t = 0.0
         self.unstick_exit_turn_start_t = None  # set when exit turn begins
+        self.odom_received = False
+        self.nearest_rear = float('inf')
 
         # ── Waypoints ────────────────────────────────────────────────────────
         self.waypoints      = self._load_waypoints()
@@ -347,7 +349,16 @@ class AutonomousSearch(Node):
                 self.get_logger().warn(
                     f'[STUCK] Backup ended — dist={dist:.2f} m  elapsed={elapsed:.1f} s — starting exit turn')
             else:
-                self._publish_twist(STUCK_BACKUP_SPEED, 0.3)
+                if self.nearest_rear <= AVOID_DISTANCE:
+                    # Something behind us — stop backup early, go straight to exit turn
+                    self.stop()
+                    self.unsticking = False
+                    self.unstick_exit_turn_start_t = time.time()
+                    self.pos_history.clear()
+                    self.get_logger().warn(
+                        f'[STUCK-BACKUP] Obstacle behind at {self.nearest_rear:.2f} m — aborting backup, starting exit turn')
+                else:
+                    self._publish_twist(STUCK_BACKUP_SPEED, 0.0)
             return True
 
         if self._is_stuck():
@@ -363,9 +374,16 @@ class AutonomousSearch(Node):
         if self.unstick_exit_turn_start_t is not None:
             turn_elapsed = time.time() - self.unstick_exit_turn_start_t
             if turn_elapsed < STUCK_EXIT_TURN_DUR_S:
-                self._publish_twist(0.0, STUCK_EXIT_TURN_SPEED)
-                self.get_logger().info(
-                    f'[STUCK-EXIT-TURN] {turn_elapsed:.1f}/{STUCK_EXIT_TURN_DUR_S:.1f} s')
+                # Abort turn if something suddenly appears ahead
+                if self.nearest_front <= AVOID_DISTANCE:
+                    self.stop()
+                    self.unstick_exit_turn_start_t = None
+                    self.get_logger().warn(
+                        f'[STUCK-EXIT-TURN] Obstacle ahead at {self.nearest_front:.2f} m — aborting turn early')
+                else:
+                    self._publish_twist(0.0, STUCK_EXIT_TURN_SPEED)
+                    self.get_logger().info(
+                        f'[STUCK-EXIT-TURN] {turn_elapsed:.1f}/{STUCK_EXIT_TURN_DUR_S:.1f} s')
                 return True
             else:
                 self.unstick_exit_turn_start_t = None
@@ -470,7 +488,12 @@ class AutonomousSearch(Node):
         left_hw = int(round(math.radians(PERIMETER_SIDE_ARC) / inc))
         self.nearest_left_side = arc_min(left_i - left_hw, left_i + left_hw)
 
+        rear_i  = front_i + int(round(math.radians(180) / inc))
+        rear_hw = int(round(math.radians(30) / inc))
+        self.nearest_rear = arc_min(rear_i - rear_hw, rear_i + rear_hw)
+
     def odom_callback(self, msg):
+        self.odom_received = True
         pos = msg.pose.pose.position
         self.current_x = pos.x
         self.current_y = pos.y
@@ -641,7 +664,9 @@ class AutonomousSearch(Node):
     # ── State machine ─────────────────────────────────────────────────────────
 
     def control_loop(self):
-
+        if not self.odom_received:
+            self.get_logger().info('[INIT] Waiting for first odom message...')
+            return
         # ── Global time limit (only while still searching) ───────────────────
         if self.state in ('WALL_FOLLOWING', 'CUBE_FINDING'):
             if time.time() - self.start_time >= TIME_LIMIT_S:
