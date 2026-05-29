@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Autonomous Cube Finder — COMPSYS732
-Phase 2 autonomous search node (Harsher Turning Radius).
+Phase 2 autonomous search node (Harsher Turning Radius) with CLI Teleop Override.
 
 States: WALL_FOLLOWING → CUBE_FINDING → REPORTING → TURNING_180 → RETURNING → DONE
 """
 
 import rclpy, cv2, math, os, time, sys
+import threading, termios, tty, select
 import numpy as np
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -28,13 +29,13 @@ RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
 # ── Obstacle avoidance & Beam Steering ─────────────────────────────────────────
 AVOID_DISTANCE      = 0.3    # m — obstacle trigger distance
-FRONT_ARC_DEG       = 140     # degrees — purely for collision/front obstacle detection
+FRONT_ARC_DEG       = 140    # degrees — purely for collision/front obstacle detection
 LIDAR_OFFSET_DEG    = -90    # degrees — LiDAR mounting offset
 LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
 
 # New narrow beam configurations for directional steering choices
 BEAM_ANGLE_DEG      = 45     # degrees — offset to the left/right of center for the beams
-BEAM_WIDTH_DEG      = 10      # degrees — width of the small beam windows
+BEAM_WIDTH_DEG      = 10     # degrees — width of the small beam windows
 
 # ── Time limit ─────────────────────────────────────────────────────────────────
 TIME_LIMIT_S = 420.0         # 7 minutes — force RETURNING if cube not found
@@ -73,6 +74,28 @@ MANUAL_WAYPOINTS = [
     (1.5, 0.5),
     (1.5, 1.0),
 ]
+
+# ── Keyboard Listener Thread ───────────────────────────────────────────────────
+class KeyboardThread(threading.Thread):
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+        self.daemon = True
+        self.running = True
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        
+    def run(self):
+        tty.setcbreak(sys.stdin.fileno())
+        try:
+            while self.running:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    key = sys.stdin.read(1)
+                    if key == '\x03':  # Ctrl-C forces exit
+                        break
+                    self.node.process_key(key)
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
 
 # ── Cylinder feature extraction ────────────────────────────────────────────────
 def extract_cylinder_waypoints(pgm_path, yaml_path):
@@ -123,34 +146,6 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
             world_y = origin[1] + (h - cy) * resolution
             waypoints.append((round(world_x, 3), round(world_y, 3)))
 
-        # ── COPIED VISUALIZATION FROM PROJ2_SCRIPT_WALL_FOLLOWING ───────────────────
-        try:
-            SCALE = 8
-            debug_img = cv2.cvtColor(
-                cv2.resize(binary, (w * SCALE, h * SCALE),
-                           interpolation=cv2.INTER_NEAREST),
-                cv2.COLOR_GRAY2BGR)
-
-            # Draw the border contour on the debug image
-            scaled_contour = (border_contour * SCALE).astype(np.int32)
-            cv2.drawContours(debug_img, [scaled_contour], -1, (255, 165, 0), 1)
-
-            for (wx, wy) in waypoints:
-                px_d = int((wx - origin[0]) / resolution) * SCALE
-                py_d = int(h - (wy - origin[1]) / resolution) * SCALE
-                cv2.circle(debug_img, (px_d, py_d), 12, (0, 0, 255), 2)
-                cv2.circle(debug_img, (px_d, py_d),  3, (0, 0, 255), -1)
-                cv2.putText(debug_img, f'({wx:.2f},{wy:.2f})',
-                            (px_d + 8, py_d - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
-            debug_path = os.path.splitext(pgm_path)[0] + '_features.jpg'
-            ok = cv2.imwrite(debug_path, debug_img)
-            print(f'[EXTRACT] Debug image saved → {debug_path} (ok={ok})')
-        except Exception as e:
-            print(f'[EXTRACT] Debug image failed: {e}')
-        # ───────────────────────────────────────────────────────────────────────────
-
         return waypoints
     except Exception as e:
         print(f'[EXTRACT] Exception: {e}')
@@ -174,15 +169,15 @@ class AutonomousSearch(Node):
         self.current_y         = 0.0
         self.current_yaw       = 0.0
         self.nearest_front     = float('inf')
-        self.beam_left_dist    = float('inf')  # Narrow steering beam (left)
-        self.beam_right_dist   = float('inf')  # Narrow steering beam (right)
+        self.beam_left_dist    = float('inf')  
+        self.beam_right_dist   = float('inf')  
         self.latest_scan       = None
         self.latest_image      = None
         self.cube_detected     = False
         self.odom_received     = False
         
         # ── Movement / Avoidance state ────────────────────────────────────────
-        self.avoid_dir         = 0     # 0 = direct to goal, 1 = left, -1 = right
+        self.avoid_dir         = 0     
         
         # ── 360° spin bookkeeping ─────────────────────────────────────────────
         self.spin_dir         = 1.0   
@@ -197,6 +192,12 @@ class AutonomousSearch(Node):
         # ── 180° turn bookkeeping ─────────────────────────────────────────────
         self.turn_180_last_yaw    = None
         self.turn_180_accumulated = 0.0
+
+        # ── Teleoperation state ───────────────────────────────────────────────
+        self.teleop_mode       = False
+        self.teleop_linear     = 0.0
+        self.teleop_angular    = 0.0
+        self.last_key_time     = 0.0
 
         # ── Waypoints ────────────────────────────────────────────────────────
         self.waypoints      = self._load_waypoints()
@@ -220,20 +221,54 @@ class AutonomousSearch(Node):
         self.start_time = time.time()
         self.cube_x, self.cube_y, self.return_x, self.return_y = None, None, None, None
         
-        self.state = None # Set to None initially so the entry log is clean
+        self.state = None 
         self.set_state(initial_state)
 
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info(f'Autonomous search started (Harsh Turning Active)')
+        self.get_logger().info('Autonomous search started (Harsh Turning Active). Press keys in terminal to interrupt.')
+
+    def process_key(self, key):
+        """Handle incoming keyboard presses from the background thread."""
+        self.last_key_time = time.time()
+        
+        if key == 't':
+            self.teleop_mode = not self.teleop_mode
+            mode_str = "ON" if self.teleop_mode else "OFF"
+            self.get_logger().info(f'[TELEOP] Teleoperation mode: {mode_str}')
+            self.stop()
+            self.teleop_linear = 0.0
+            self.teleop_angular = 0.0
+        elif key == 'r':
+            self.get_logger().info('[KEYBOARD] Force switching to RETURNING state')
+            self.teleop_mode = False
+            self.set_state('RETURNING')
+        elif key == 's':
+            self.get_logger().info('[KEYBOARD] Force switching to WALL_FOLLOWING (Search) state')
+            self.teleop_mode = False
+            self.set_state('WALL_FOLLOWING')
+        elif key == 'c':
+            self.get_logger().info('[KEYBOARD] Force switching to CUBE_FINDING state')
+            self.teleop_mode = False
+            self._start_spin()  # Reset spin parameters before forcing state
+            self.set_state('CUBE_FINDING')
+        
+        # Read movement keys only if teleop is active
+        if self.teleop_mode:
+            if key == 'i':
+                self.teleop_linear = FORWARD_SPEED
+                self.teleop_angular = 0.0
+            elif key == 'j':
+                self.teleop_linear = 0.0
+                self.teleop_angular = TURN_SPEED
+            elif key == 'l':
+                self.teleop_linear = 0.0
+                self.teleop_angular = -TURN_SPEED
 
     def set_state(self, new_state):
-        """Helper to centralize state assignments and log exits/entries automatically."""
         if self.state == new_state:
             return
-            
         if self.state is not None:
             self.get_logger().info(f'[STATE] Exiting state: {self.state}')
-            
         self.state = new_state
         self.get_logger().info(f'[STATE] Entering state: {self.state}')
 
@@ -243,59 +278,6 @@ class AutonomousSearch(Node):
         cylinders = extract_cylinder_waypoints(PGM_MAP_PATH, PGM_MAP_YAML)
         if not cylinders:
             return list(MANUAL_WAYPOINTS)
-
-        # ── COPIED PATH MAP VISUALIZATION FROM PROJ2_SCRIPT_WALL_FOLLOWING ──────────
-        try:
-            import yaml
-            with open(PGM_MAP_YAML, 'r') as f:
-                meta = yaml.safe_load(f)
-            resolution = meta['resolution']
-            origin     = meta['origin']
-
-            img = cv2.imread(PGM_MAP_PATH, cv2.IMREAD_GRAYSCALE)
-            if img is not None:
-                h, w = img.shape
-                SCALE = 6
-                debug_img = cv2.cvtColor(
-                    cv2.resize(img, (w * SCALE, h * SCALE),
-                               interpolation=cv2.INTER_NEAREST),
-                    cv2.COLOR_GRAY2BGR)
-
-                def w2p_scaled(wx, wy):
-                    px = int((wx - origin[0]) / resolution)
-                    py = int(h - (wy - origin[1]) / resolution)
-                    return (max(0, min(w - 1, px)) * SCALE,
-                            max(0, min(h - 1, py)) * SCALE)
-
-                origin_px = w2p_scaled(0.0, 0.0)
-                cv2.circle(debug_img, origin_px, 6, (255, 0, 0), -1)
-                cv2.arrowedLine(debug_img, origin_px, w2p_scaled(0.4, 0.0),
-                                (0, 0, 255), 3, tipLength=0.2)
-                cv2.arrowedLine(debug_img, origin_px, w2p_scaled(0.0, 0.4),
-                                (0, 255, 0), 3, tipLength=0.2)
-
-                sequence = [(0.0, 0.0)] + cylinders
-                for i in range(len(sequence) - 1):
-                    pt1 = w2p_scaled(*sequence[i])
-                    pt2 = w2p_scaled(*sequence[i + 1])
-                    cv2.arrowedLine(debug_img, pt1, pt2, (0, 200, 255), 2,
-                                    tipLength=0.04)
-
-                for i, (wx, wy) in enumerate(cylinders):
-                    px = w2p_scaled(wx, wy)
-                    cv2.circle(debug_img, px, 10, (0, 0, 255), -1)
-                    cv2.putText(debug_img, f'{i}:({wx:.2f},{wy:.2f})',
-                                (px[0] + 8, px[1] - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-
-                debug_path = os.path.expanduser('~/Desktop/path_debug.jpg')
-                ok = cv2.imwrite(debug_path, debug_img)
-                self.get_logger().info(
-                    f'[DEBUG] Waypoint map saved → {debug_path} (ok={ok})')
-        except Exception as e:
-            self.get_logger().warn(f'[DEBUG] Exception generating debug image: {e}')
-        # ───────────────────────────────────────────────────────────────────────────
-
         return list(cylinders)
 
     def scan_callback(self, msg):
@@ -303,11 +285,9 @@ class AutonomousSearch(Node):
         inc     = msg.angle_increment
         n       = len(msg.ranges)
         
-        # 1. Front Detection Arc index calculations (Used purely for tracking front obstacles)
         front_i = int(round((LIDAR_OFFSET_RAD - msg.angle_min) / inc))
         front_half_a = int(round(math.radians(FRONT_ARC_DEG) / 2.0 / inc))
 
-        # 2. Narrow Decision-Making Beam index calculations
         beam_half_w  = int(round(math.radians(BEAM_WIDTH_DEG) / 2.0 / inc))
         beam_offset  = int(round(math.radians(BEAM_ANGLE_DEG) / inc))
         
@@ -321,7 +301,6 @@ class AutonomousSearch(Node):
                     if msg.range_min < r < msg.range_max and not math.isnan(r) and not math.isinf(r)]
             return min(vals) if vals else float('inf')
 
-        # Evaluate the front arc and the two small steering beams
         self.nearest_front   = arc_min(front_i, front_half_a)
         self.beam_left_dist  = arc_min(left_beam_i, beam_half_w)
         self.beam_right_dist = arc_min(right_beam_i, beam_half_w)
@@ -390,35 +369,25 @@ class AutonomousSearch(Node):
         except Exception: pass
 
     def _simple_steer(self, target_x, target_y):
-        """Direct-to-goal with narrow-beam obstacle verification."""
         target_angle = math.atan2(target_y - self.current_y, target_x - self.current_x)
         heading_err = self._angle_diff(target_angle, self.current_yaw)
 
-        # 1. Obstacle inside front arc -> Switch to evasive rotation using the narrow beams
         if self.nearest_front <= AVOID_DISTANCE:
             if self.avoid_dir == 0:
-                # Decide turning direction based on the larger beam reading (clearer side)
                 if self.beam_left_dist >= self.beam_right_dist:
-                    self.avoid_dir = 1.0  # Turn left
+                    self.avoid_dir = 1.0  
                 else:
-                    self.avoid_dir = -1.0 # Turn right
+                    self.avoid_dir = -1.0 
                 self.get_logger().info(f'[AVOID] Front block. Left beam: {self.beam_left_dist:.2f}m, Right beam: {self.beam_right_dist:.2f}m. Pivoting {"LEFT" if self.avoid_dir > 0 else "RIGHT"}')
-            
             return 0.0, self.avoid_dir * AVOID_TURN_SPEED
-
-        # 2. Path directly ahead is clear
         else:
             if self.avoid_dir != 0:
-                # Is the goal clear enough to stop tracing?
                 if abs(heading_err) < 0.2:
                     self.get_logger().info('[AVOID] Target clear. Resuming goal tracking.')
                     self.avoid_dir = 0
                     return FORWARD_SPEED, 0.0
                 else:
-                    # Tight contouring arc away from obstacle
                     return FORWARD_SPEED * 0.4, -self.avoid_dir * (AVOID_TURN_SPEED * 0.85)
-            
-            # 3. Standard track to goal
             else:
                 angular = float(np.clip(heading_err * 3.0, -TURN_SPEED, TURN_SPEED))
                 speed_factor = max(0.2, 1.0 - (abs(heading_err) / (math.pi / 2)))
@@ -427,7 +396,6 @@ class AutonomousSearch(Node):
     def _start_spin(self):
         self.spin_start_yaw, self.spin_last_yaw = self.current_yaw, self.current_yaw
         self.spin_accumulated, self.cube_detected = 0.0, False
-        # Choose spin direction toward the side with more clearance according to narrow beams
         self.spin_dir = 1.0 if self.beam_left_dist >= self.beam_right_dist else -1.0
 
     def _update_spin(self):
@@ -439,11 +407,15 @@ class AutonomousSearch(Node):
     def control_loop(self):
         if not self.odom_received: return
 
-        # if self.state in ('WALL_FOLLOWING', 'CUBE_FINDING'):
-        #     if time.time() - self.start_time >= TIME_LIMIT_S:
-        #         self.stop()
-        #         self.set_state('RETURNING')
-        #         return
+        # ── TELEOPERATION OVERRIDE ───────────────────────────────────────────
+        if self.teleop_mode:
+            # If no key was held down for 0.2 seconds, automatically halt to prevent run-away
+            if time.time() - self.last_key_time > 0.2:
+                self.teleop_linear = 0.0
+                self.teleop_angular = 0.0
+                
+            self._publish_twist(self.teleop_linear, self.teleop_angular)
+            return
 
         # ── WALL_FOLLOWING ───────────────────────────────────────────────────
         if self.state == 'WALL_FOLLOWING':
@@ -507,19 +479,16 @@ class AutonomousSearch(Node):
             self._save_results_text(self.current_x, self.current_y, cube_dist, self.cube_x, self.cube_y)
             self._save_snapshot()
             
-            # Start the 180 degree turn setup
             self.turn_180_last_yaw = self.current_yaw
             self.turn_180_accumulated = 0.0
             self.set_state('TURNING_180')
 
         # ── TURNING_180 ──────────────────────────────────────────────────────
         elif self.state == 'TURNING_180':
-            # Accumulate angular distance
             delta = abs(self._angle_diff(self.current_yaw, self.turn_180_last_yaw))
             self.turn_180_accumulated += delta
             self.turn_180_last_yaw = self.current_yaw
             
-            # Complete when 180 degrees (pi radians) is reached
             if self.turn_180_accumulated >= math.pi:
                 self.stop()
                 self.set_state('RETURNING')
@@ -546,9 +515,18 @@ class AutonomousSearch(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = AutonomousSearch()
-    try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
+    
+    # Start background keyboard listener thread
+    kb_thread = KeyboardThread(node)
+    kb_thread.start()
+    
+    try: 
+        rclpy.spin(node)
+    except KeyboardInterrupt: 
+        pass
     finally:
+        kb_thread.running = False
+        kb_thread.join(timeout=0.5)
         cv2.destroyAllWindows()
         node.stop()
         node.destroy_node()
