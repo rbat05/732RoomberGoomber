@@ -18,7 +18,7 @@ from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 
 # ── Robot namespace ────────────────────────────────────────────────────────────
-NAMESPACE = '/T13'
+NAMESPACE = '/T19'
 
 # ── Motion parameters ──────────────────────────────────────────────────────────
 FORWARD_SPEED    = 0.15      # m/s — waypoint navigation
@@ -26,7 +26,7 @@ TURN_SPEED       = 0.8       # rad/s — waypoint navigation turns
 AVOID_TURN_SPEED = 0.5       # rad/s — obstacle avoidance turns
 
 # ── Tolerances ─────────────────────────────────────────────────────────────────
-WAYPOINT_TOLERANCE  = 1    # m — close enough to waypoint to advance
+WAYPOINT_TOLERANCE  = 0.75    # m — close enough to waypoint to advance
 RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
 # ── Obstacle avoidance ─────────────────────────────────────────────────────────
@@ -62,8 +62,8 @@ SPIN_SPEED       = 1       # rad/s — rotation speed during cube-finding spin
 SPIN_FULL_CIRCLE = 2 * math.pi  # radians — one complete revolution
 
 # ── Map paths ─────────────────────────────────────────────────────────────────
-PGM_MAP_PATH = os.path.expanduser('~/Desktop/lab_map_c_2.pgm')
-PGM_MAP_YAML = os.path.expanduser('~/Desktop/lab_map_c_2.yaml')
+PGM_MAP_PATH = os.path.expanduser('~/Desktop/lab_map_c_fri.pgm')
+PGM_MAP_YAML = os.path.expanduser('~/Desktop/lab_map_c_fri.yaml')
 
 
 CUBE_SEARCH_STEP_M   = 0.20   # m — nudge forward each retry
@@ -329,66 +329,79 @@ class AutonomousSearch(Node):
 
     def _handle_stuck(self):
         """
-        Unstick by reversing 30 cm.
+        Unstick by turning 180, driving forward, and turning 180 again.
         Returns True while unsticking (caller must return immediately).
         """
         if self.unsticking:
-            elapsed = time.time() - self.unstick_backup_start_t   # add this
+            if self.unstick_phase == 'TURN1':
+                # Accumulate yaw to turn 180 degrees (math.pi)
+                delta = abs(self._angle_diff(self.current_yaw, self.spin_last_yaw))
+                self.spin_accumulated += delta
+                self.spin_last_yaw = self.current_yaw
 
-            dist = math.sqrt(
-                (self.current_x - self.unstick_drive_start_x) ** 2 +
-                (self.current_y - self.unstick_drive_start_y) ** 2)
-            self.get_logger().info(
-                f'[STUCK-BACKUP] reversed={dist:.2f}/{STUCK_BACKUP_DIST:.2f} m')
-
-            if dist >= STUCK_BACKUP_DIST or elapsed >= STUCK_BACKUP_TIMEOUT_S:
-                self.stop()
-                self.unsticking = False
-                self.unstick_exit_turn_start_t = time.time()
-                self.pos_history.clear()
-                self.get_logger().warn(
-                    f'[STUCK] Backup ended — dist={dist:.2f} m  elapsed={elapsed:.1f} s — starting exit turn')
-            else:
-                if self.nearest_rear <= AVOID_DISTANCE:
-                    # Something behind us — stop backup early, go straight to exit turn
+                if self.spin_accumulated >= math.pi:
                     self.stop()
-                    self.unsticking = False
-                    self.unstick_exit_turn_start_t = time.time()
-                    self.pos_history.clear()
-                    self.get_logger().warn(
-                        f'[STUCK-BACKUP] Obstacle behind at {self.nearest_rear:.2f} m — aborting backup, starting exit turn')
-                else:
-                    self._publish_twist(STUCK_BACKUP_SPEED, 0.0)
-            return True
-
-        if self._is_stuck():
-            self.get_logger().warn('[STUCK] Detected — reversing')
-            self.unsticking            = True
-            self.unstick_backup_start_t = time.time()   # ← add this line
-            self.unstick_drive_start_x = self.current_x
-            self.unstick_drive_start_y = self.current_y
-            self._publish_twist(STUCK_BACKUP_SPEED, 0.0)
-            return True
-        
-        # ── Exit turn after backup ────────────────────────────────────────────
-        if self.unstick_exit_turn_start_t is not None:
-            turn_elapsed = time.time() - self.unstick_exit_turn_start_t
-            if turn_elapsed < STUCK_EXIT_TURN_DUR_S:
-                # Abort turn if something suddenly appears ahead
-                if self.nearest_front <= AVOID_DISTANCE:
-                    self.stop()
-                    self.unstick_exit_turn_start_t = None
-                    self.get_logger().warn(
-                        f'[STUCK-EXIT-TURN] Obstacle ahead at {self.nearest_front:.2f} m — aborting turn early')
+                    self.unstick_phase = 'DRIVE'
+                    self.unstick_drive_start_x = self.current_x
+                    self.unstick_drive_start_y = self.current_y
+                    self.unstick_backup_start_t = time.time()
+                    self.get_logger().info('[STUCK] TURN1 done — starting DRIVE')
                 else:
                     self._publish_twist(0.0, STUCK_EXIT_TURN_SPEED)
-                    self.get_logger().info(
-                        f'[STUCK-EXIT-TURN] {turn_elapsed:.1f}/{STUCK_EXIT_TURN_DUR_S:.1f} s')
-                return True
-            else:
-                self.unstick_exit_turn_start_t = None
-                self.get_logger().info('[STUCK] Exit turn done — resuming normally')
 
+            elif self.unstick_phase == 'DRIVE':
+                elapsed = time.time() - self.unstick_backup_start_t
+                dist = math.sqrt(
+                    (self.current_x - self.unstick_drive_start_x) ** 2 +
+                    (self.current_y - self.unstick_drive_start_y) ** 2)
+
+                # Stop driving if obstacle detected in front
+                if self.nearest_front <= AVOID_DISTANCE:
+                    self.stop()
+                    self.unstick_phase = 'TURN2'
+                    self.spin_accumulated = 0.0
+                    self.spin_last_yaw = self.current_yaw
+                    self.get_logger().warn(
+                        f'[STUCK] Obstacle ahead at {self.nearest_front:.2f} m — aborting DRIVE early, starting TURN2')
+                
+                # Stop driving if we reached the target distance or timeout
+                elif dist >= STUCK_BACKUP_DIST or elapsed >= STUCK_BACKUP_TIMEOUT_S:
+                    self.stop()
+                    self.unstick_phase = 'TURN2'
+                    self.spin_accumulated = 0.0
+                    self.spin_last_yaw = self.current_yaw
+                    self.get_logger().info(f'[STUCK] DRIVE done ({dist:.2f} m) — starting TURN2')
+                
+                else:
+                    # Drive forward (using the absolute value of the backup speed)
+                    self._publish_twist(abs(STUCK_BACKUP_SPEED), 0.0)
+
+            elif self.unstick_phase == 'TURN2':
+                # Accumulate yaw for the second 180-degree turn
+                delta = abs(self._angle_diff(self.current_yaw, self.spin_last_yaw))
+                self.spin_accumulated += delta
+                self.spin_last_yaw = self.current_yaw
+
+                if self.spin_accumulated >= math.pi:
+                    self.stop()
+                    self.unsticking = False
+                    self.unstick_phase = None
+                    self.pos_history.clear()
+                    self.get_logger().info('[STUCK] TURN2 done — resuming normal operation')
+                else:
+                    self._publish_twist(0.0, STUCK_EXIT_TURN_SPEED)
+
+            return True
+
+        # Triggering the unstick sequence
+        if self._is_stuck():
+            self.get_logger().warn('[STUCK] Detected — starting 180 TURN1')
+            self.unsticking = True
+            self.unstick_phase = 'TURN1'
+            self.spin_accumulated = 0.0
+            self.spin_last_yaw = self.current_yaw
+            return True
+        
         return False
 
     # ── Waypoint loading ──────────────────────────────────────────────────────
@@ -487,10 +500,6 @@ class AutonomousSearch(Node):
         left_i  = front_i + int(round(math.radians(90) / inc))
         left_hw = int(round(math.radians(PERIMETER_SIDE_ARC) / inc))
         self.nearest_left_side = arc_min(left_i - left_hw, left_i + left_hw)
-
-        rear_i  = front_i + int(round(math.radians(180) / inc))
-        rear_hw = int(round(math.radians(30) / inc))
-        self.nearest_rear = arc_min(rear_i - rear_hw, rear_i + rear_hw)
 
     def odom_callback(self, msg):
         self.odom_received = True
