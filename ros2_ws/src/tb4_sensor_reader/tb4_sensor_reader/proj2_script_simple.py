@@ -50,9 +50,8 @@ SLICE_WIDTH = 50             # Width of the central vertical corridor in pixels
 MIN_PIXELS  = 1000           # Min red pixels inside the slice to trigger
 
 # ── File Output Paths ──────────────────────────────────────────────────────────
-SNAPSHOT_PATH     = os.path.expanduser('~/Desktop/detection_snapshot.jpg')
-RESULTS_PATH      = os.path.expanduser('~/Desktop/RESULTS.txt')
-WAYPOINT_MAP_PATH = os.path.expanduser('~/Desktop/extracted_waypoints.png') # Added path
+SNAPSHOT_PATH = os.path.expanduser('~/Desktop/detection_snapshot.jpg')
+RESULTS_PATH  = os.path.expanduser('~/Desktop/RESULTS.txt')
 
 # ── LiDAR cube distance estimation ────────────────────────────────────────────
 CUBE_FORWARD_ARC_DEG = 3     
@@ -88,9 +87,6 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
         if img is None: return None
         h, w = img.shape
         
-        # Create a color baseline image to draw features on
-        img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        
         _, binary = cv2.threshold(img, 50, 255, cv2.THRESH_BINARY_INV)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             binary, connectivity=8)
@@ -102,9 +98,6 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
         contours, _ = cv2.findContours(wall_mask, cv2.RETR_EXTERNAL,
                                         cv2.CHAIN_APPROX_SIMPLE)
         border_contour = max(contours, key=cv2.contourArea)
-
-        # Overlay the detected wall boundary contour in GREEN
-        cv2.drawContours(img_color, [border_contour], -1, (0, 255, 0), 2)
 
         def is_inside_border(px, py):
             return cv2.pointPolygonTest(border_contour, (float(px), float(py)), False) >= 0
@@ -126,20 +119,38 @@ def extract_cylinder_waypoints(pgm_path, yaml_path):
             if aspect_ratio < 0.5 or aspect_ratio > 2.0: continue
             if not is_inside_border(cx, cy): continue
 
-            # Plot verified waypoints as RED dots
-            cv2.circle(img_color, (int(cx), int(cy)), 5, (0, 0, 255), -1)
-            # Label them sequentially with BLUE text index numbers
-            cv2.putText(img_color, str(len(waypoints)), (int(cx) + 8, int(cy) + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-
             world_x = origin[0] + cx * resolution
             world_y = origin[1] + (h - cy) * resolution
             waypoints.append((round(world_x, 3), round(world_y, 3)))
-            
-        # Export visual image back out to your Desktop
-        cv2.imwrite(WAYPOINT_MAP_PATH, img_color)
-        print(f'[EXTRACT] Feature map visualization saved to: {WAYPOINT_MAP_PATH}')
-        
+
+        # ── COPIED VISUALIZATION FROM PROJ2_SCRIPT_WALL_FOLLOWING ───────────────────
+        try:
+            SCALE = 8
+            debug_img = cv2.cvtColor(
+                cv2.resize(binary, (w * SCALE, h * SCALE),
+                           interpolation=cv2.INTER_NEAREST),
+                cv2.COLOR_GRAY2BGR)
+
+            # Draw the border contour on the debug image
+            scaled_contour = (border_contour * SCALE).astype(np.int32)
+            cv2.drawContours(debug_img, [scaled_contour], -1, (255, 165, 0), 1)
+
+            for (wx, wy) in waypoints:
+                px_d = int((wx - origin[0]) / resolution) * SCALE
+                py_d = int(h - (wy - origin[1]) / resolution) * SCALE
+                cv2.circle(debug_img, (px_d, py_d), 12, (0, 0, 255), 2)
+                cv2.circle(debug_img, (px_d, py_d),  3, (0, 0, 255), -1)
+                cv2.putText(debug_img, f'({wx:.2f},{wy:.2f})',
+                            (px_d + 8, py_d - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+            debug_path = os.path.splitext(pgm_path)[0] + '_features.jpg'
+            ok = cv2.imwrite(debug_path, debug_img)
+            print(f'[EXTRACT] Debug image saved → {debug_path} (ok={ok})')
+        except Exception as e:
+            print(f'[EXTRACT] Debug image failed: {e}')
+        # ───────────────────────────────────────────────────────────────────────────
+
         return waypoints
     except Exception as e:
         print(f'[EXTRACT] Exception: {e}')
@@ -232,6 +243,59 @@ class AutonomousSearch(Node):
         cylinders = extract_cylinder_waypoints(PGM_MAP_PATH, PGM_MAP_YAML)
         if not cylinders:
             return list(MANUAL_WAYPOINTS)
+
+        # ── COPIED PATH MAP VISUALIZATION FROM PROJ2_SCRIPT_WALL_FOLLOWING ──────────
+        try:
+            import yaml
+            with open(PGM_MAP_YAML, 'r') as f:
+                meta = yaml.safe_load(f)
+            resolution = meta['resolution']
+            origin     = meta['origin']
+
+            img = cv2.imread(PGM_MAP_PATH, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                h, w = img.shape
+                SCALE = 6
+                debug_img = cv2.cvtColor(
+                    cv2.resize(img, (w * SCALE, h * SCALE),
+                               interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR)
+
+                def w2p_scaled(wx, wy):
+                    px = int((wx - origin[0]) / resolution)
+                    py = int(h - (wy - origin[1]) / resolution)
+                    return (max(0, min(w - 1, px)) * SCALE,
+                            max(0, min(h - 1, py)) * SCALE)
+
+                origin_px = w2p_scaled(0.0, 0.0)
+                cv2.circle(debug_img, origin_px, 6, (255, 0, 0), -1)
+                cv2.arrowedLine(debug_img, origin_px, w2p_scaled(0.4, 0.0),
+                                (0, 0, 255), 3, tipLength=0.2)
+                cv2.arrowedLine(debug_img, origin_px, w2p_scaled(0.0, 0.4),
+                                (0, 255, 0), 3, tipLength=0.2)
+
+                sequence = [(0.0, 0.0)] + cylinders
+                for i in range(len(sequence) - 1):
+                    pt1 = w2p_scaled(*sequence[i])
+                    pt2 = w2p_scaled(*sequence[i + 1])
+                    cv2.arrowedLine(debug_img, pt1, pt2, (0, 200, 255), 2,
+                                    tipLength=0.04)
+
+                for i, (wx, wy) in enumerate(cylinders):
+                    px = w2p_scaled(wx, wy)
+                    cv2.circle(debug_img, px, 10, (0, 0, 255), -1)
+                    cv2.putText(debug_img, f'{i}:({wx:.2f},{wy:.2f})',
+                                (px[0] + 8, px[1] - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+                debug_path = os.path.expanduser('~/Desktop/path_debug.jpg')
+                ok = cv2.imwrite(debug_path, debug_img)
+                self.get_logger().info(
+                    f'[DEBUG] Waypoint map saved → {debug_path} (ok={ok})')
+        except Exception as e:
+            self.get_logger().warn(f'[DEBUG] Exception generating debug image: {e}')
+        # ───────────────────────────────────────────────────────────────────────────
+
         return list(cylinders)
 
     def scan_callback(self, msg):
@@ -375,11 +439,11 @@ class AutonomousSearch(Node):
     def control_loop(self):
         if not self.odom_received: return
 
-        if self.state in ('WALL_FOLLOWING', 'CUBE_FINDING'):
-            if time.time() - self.start_time >= TIME_LIMIT_S:
-                self.stop()
-                self.set_state('RETURNING')
-                return
+        # if self.state in ('WALL_FOLLOWING', 'CUBE_FINDING'):
+        #     if time.time() - self.start_time >= TIME_LIMIT_S:
+        #         self.stop()
+        #         self.set_state('RETURNING')
+        #         return
 
         # ── WALL_FOLLOWING ───────────────────────────────────────────────────
         if self.state == 'WALL_FOLLOWING':
