@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Autonomous Cube Finder — COMPSYS732
+Autonomous Cube Finder — COMPSYS732 OLD
 Phase 2 autonomous search node.
 
 States: WALL_FOLLOWING → CUBE_FINDING → REPORTING → RETURNING → DONE
