@@ -28,8 +28,8 @@ WAYPOINT_TOLERANCE  = 0.75   # m — close enough to waypoint to advance
 RETURN_TOLERANCE    = 0.15   # m — close enough to origin to stop
 
 # ── Obstacle avoidance & Beam Steering ─────────────────────────────────────────
-AVOID_DISTANCE      = 0.4   # m — front cone trigger distance
-SIDE_AVOID_DISTANCE = 0.4    # m — diagonal (45°) beam trigger distance
+AVOID_DISTANCE      = 0.30   # m — front cone trigger distance
+SIDE_AVOID_DISTANCE = 0.30    # m — diagonal (45°) beam trigger distance
 FRONT_ARC_DEG       = 60     # degrees — narrow collision cone directly ahead
 LIDAR_OFFSET_DEG    = -90    # degrees — LiDAR mounting offset
 LIDAR_OFFSET_RAD    = math.radians(LIDAR_OFFSET_DEG)
@@ -44,7 +44,7 @@ LATERAL_BEAM_ANGLE_DEG     = 90    # degrees — offset from centre for lateral 
                                     # Positive values push them rearward (>90°);
                                     # Negative values pull them forward (<90°).
 LATERAL_BEAM_WIDTH_DEG     = 10    # degrees — arc width of each lateral beam window
-LATERAL_AVOID_DISTANCE     = 0.3  # m — trigger threshold for lateral beams
+LATERAL_AVOID_DISTANCE     = 0.25  # m — trigger threshold for lateral beams
                                     # Independent from SIDE_AVOID_DISTANCE so you can
                                     # tune lateral sensitivity without affecting the 45° beams.
 
@@ -73,8 +73,8 @@ CUBE_SEARCH_STEP_M   = 0.20
 CUBE_SEARCH_MAX_SPINS = 1     
 
 # ── Map paths ─────────────────────────────────────────────────────────────────
-PGM_MAP_PATH = os.path.expanduser('~/Desktop/lab_map_c_fri.pgm')
-PGM_MAP_YAML = os.path.expanduser('~/Desktop/lab_map_c_fri.yaml')
+PGM_MAP_PATH = os.path.expanduser('~/Desktop/backup/map.pgm')
+PGM_MAP_YAML = os.path.expanduser('~/Desktop/backup/map.yaml')
 
 # ── Manual waypoint fallback ───────────────────────────────────────────────────
 MANUAL_WAYPOINTS = [
